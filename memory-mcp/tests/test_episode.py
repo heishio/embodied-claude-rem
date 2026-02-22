@@ -3,16 +3,16 @@
 
 import pytest
 
-from src.memory_mcp.config import MemoryConfig
-from src.memory_mcp.episode import EpisodeManager
-from src.memory_mcp.memory import MemoryStore
+from memory_mcp.config import MemoryConfig
+from memory_mcp.episode import EpisodeManager
+from memory_mcp.memory import MemoryStore
 
 
 @pytest.fixture
 async def memory_store():
     """Create a MemoryStore instance for testing."""
     config = MemoryConfig(
-        db_path=":memory:",  # In-memory for testing
+        db_path=":memory:",
         collection_name="test_memories",
     )
     store = MemoryStore(config)
@@ -24,8 +24,7 @@ async def memory_store():
 @pytest.fixture
 async def episode_manager(memory_store):
     """Create an EpisodeManager instance."""
-    collection = memory_store.get_episodes_collection()
-    return EpisodeManager(memory_store, collection)
+    return EpisodeManager(memory_store)
 
 
 class TestEpisodeCreation:

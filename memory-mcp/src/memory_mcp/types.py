@@ -29,6 +29,7 @@ class Category(str, Enum):
     OBSERVATION = "observation"
     FEELING = "feeling"
     CONVERSATION = "conversation"
+    CURIOSITY = "curiosity"
 
 
 # Phase 5: 因果リンク
@@ -154,7 +155,7 @@ class Episode:
     importance: int  # 1-5
 
     def to_metadata(self) -> dict[str, Any]:
-        """Convert to dictionary for ChromaDB metadata."""
+        """Convert to dictionary for storage metadata."""
         return {
             "title": self.title,
             "start_time": self.start_time,
@@ -170,7 +171,7 @@ class Episode:
     def from_metadata(
         cls, id: str, summary: str, metadata: dict[str, Any]
     ) -> "Episode":
-        """Create from ChromaDB metadata."""
+        """Create from storage metadata."""
         return cls(
             id=id,
             title=metadata["title"],
@@ -222,8 +223,10 @@ class Memory:
     coactivation_weights: tuple[tuple[str, float], ...] = field(default_factory=tuple)
 
     def to_metadata(self) -> dict[str, Any]:
-        """Convert to dictionary for ChromaDB metadata."""
+        """Convert to dictionary for storage metadata."""
         metadata: dict[str, Any] = {
+            # Phase 8: 元テキストをメタデータに保存
+            "content": self.content,
             "timestamp": self.timestamp,
             "emotion": self.emotion,
             "importance": self.importance,
@@ -252,6 +255,87 @@ class Memory:
         return metadata
 
 
+# 動詞チェーン（体験記憶）
+
+
+@dataclass(frozen=True)
+class VerbStep:
+    """動詞チェーンの1ステップ."""
+
+    verb: str  # "見る"
+    nouns: tuple[str, ...]  # ("シオ", "キーボード")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {"verb": self.verb, "nouns": list(self.nouns)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VerbStep":
+        """Create from dictionary."""
+        return cls(verb=data["verb"], nouns=tuple(data.get("nouns", ())))
+
+    def to_text(self) -> str:
+        """テキスト表現: 見る(シオ, キーボード)."""
+        if self.nouns:
+            return f"{self.verb}({', '.join(self.nouns)})"
+        return self.verb
+
+
+@dataclass(frozen=True)
+class VerbChain:
+    """動詞チェーン（1体験の流れ）."""
+
+    id: str
+    steps: tuple[VerbStep, ...]  # 動詞の流れ
+    timestamp: str  # ISO 8601
+    emotion: str  # happy, sad, etc.
+    importance: int  # 1-5
+    source: str  # "buffer" | "manual"
+    context: str  # 自由記述の補足
+
+    def to_document(self) -> str:
+        """埋め込み用テキスト."""
+        parts = [step.to_text() for step in self.steps]
+        doc = " → ".join(parts)
+        if self.context:
+            doc = f"{doc} [{self.context}]"
+        return doc
+
+    def to_metadata(self) -> dict[str, Any]:
+        """ストレージ用メタデータ."""
+        all_verbs = list({step.verb for step in self.steps})
+        all_nouns = list({n for step in self.steps for n in step.nouns})
+        return {
+            "steps_json": json.dumps(
+                [s.to_dict() for s in self.steps], ensure_ascii=False
+            ),
+            "all_verbs": ",".join(all_verbs),
+            "all_nouns": ",".join(all_nouns),
+            "timestamp": self.timestamp,
+            "emotion": self.emotion,
+            "importance": self.importance,
+            "source": self.source,
+            "context": self.context,
+        }
+
+    @classmethod
+    def from_metadata(
+        cls, chain_id: str, metadata: dict[str, Any]
+    ) -> "VerbChain":
+        """メタデータから復元."""
+        steps_raw = json.loads(metadata.get("steps_json", "[]"))
+        steps = tuple(VerbStep.from_dict(s) for s in steps_raw)
+        return cls(
+            id=chain_id,
+            steps=steps,
+            timestamp=metadata.get("timestamp", ""),
+            emotion=metadata.get("emotion", "neutral"),
+            importance=metadata.get("importance", 3),
+            source=metadata.get("source", "manual"),
+            context=metadata.get("context", ""),
+        )
+
+
 @dataclass(frozen=True)
 class MemorySearchResult:
     """検索結果."""
@@ -265,7 +349,7 @@ class ScoredMemory:
     """スコアリング済み検索結果."""
 
     memory: Memory
-    semantic_distance: float  # ChromaDBからの生距離
+    semantic_distance: float  # 生距離
     time_decay_factor: float  # 時間減衰係数 (0.0-1.0)
     emotion_boost: float  # 感情ブースト
     importance_boost: float  # 重要度ブースト

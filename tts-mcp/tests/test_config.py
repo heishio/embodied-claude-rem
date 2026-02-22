@@ -172,6 +172,8 @@ class TestTTSConfig:
         os.environ.pop("TTS_DEFAULT_ENGINE", None)
         os.environ.pop("ELEVENLABS_API_KEY", None)
         os.environ.pop("VOICEVOX_URL", None)
+        os.environ.pop("SBV2_API_URL", None)
+        os.environ.pop("SBV2_URL", None)
         config = TTSConfig.from_env()
         try:
             config.resolve_engine()

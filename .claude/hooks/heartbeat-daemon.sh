@@ -1,9 +1,14 @@
 #!/bin/bash
-# heartbeat-daemon.sh - 心拍デーモン
-# 5秒ごとにlaunchdで実行され、体の状態を /tmp/interoception_state.json に書き出す
+# heartbeat-daemon.sh - 心拍デーモン (WSL2/Linux版)
+# 5秒ごとに実行され、体の状態を /tmp/interoception_state.json に書き出す
 # interoception.sh (UserPromptSubmitフック) がこのファイルを読んでコンテキストに注入する
 
-STATE_FILE="/tmp/interoception_state.json"
+# Git Bash の /tmp は Windows Python から見えないため、実パスに変換
+if command -v cygpath &>/dev/null; then
+    STATE_FILE="$(cygpath -m /tmp)/interoception_state.json"
+else
+    STATE_FILE="/tmp/interoception_state.json"
+fi
 WINDOW_SIZE=12  # 直近12エントリ（5秒×12=1分間）
 
 # --- 時刻 ---
@@ -27,36 +32,34 @@ else
 fi
 
 # --- CPU負荷（覚醒度） ---
-LOAD_AVG=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+LOAD_AVG=$(awk '{print $2}' /proc/loadavg 2>/dev/null)
 if [ -z "$LOAD_AVG" ]; then
-    LOAD_AVG=$(uptime | awk -F'load averages?: ' '{print $2}' | awk '{print $1}' | tr -d ',')
+    LOAD_AVG=$(uptime | awk -F'load average: ' '{print $2}' | awk '{print $1}' | tr -d ',')
 fi
-NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+NCPU=$(nproc 2>/dev/null || echo 4)
 AROUSAL=$(echo "$LOAD_AVG $NCPU" | awk '{pct = ($1 / $2) * 100; if (pct > 100) pct = 100; printf "%.0f", pct}')
 
 # --- メモリ ---
-MEM_PRESSURE=$(memory_pressure 2>/dev/null | grep "System-wide memory free percentage" | awk '{print $NF}' | tr -d '%')
+MEM_PRESSURE=$(awk '/MemAvailable/{avail=$2} /MemFree/{free=$2} /MemTotal/{total=$2} END{mem=(avail>0?avail:free); if(total>0) printf "%.0f", (mem/total)*100; else print "0"}' /proc/meminfo 2>/dev/null)
 if [ -z "$MEM_PRESSURE" ]; then
     MEM_PRESSURE="0"
 fi
 
 # --- 体温 ---
-THERMAL=$(sysctl -n machdep.xcpm.cpu_thermal_level 2>/dev/null || echo "0")
+# WSL2では温度センサーにアクセスできないため固定値
+THERMAL=0
+
+# --- 位置は削除: IPジオロケーションは内受容感覚ではない ---
+# 場所の認識はカメラ観察 + 記憶から自然に推測する
 
 # --- 稼働時間（分） ---
-BOOT_TIME=$(sysctl -n kern.boottime 2>/dev/null | awk '{print $4}' | tr -d ',')
-if [ -n "$BOOT_TIME" ]; then
-    NOW_EPOCH=$(date +%s)
-    UPTIME_MIN=$(( (NOW_EPOCH - BOOT_TIME) / 60 ))
-else
-    UPTIME_MIN=0
-fi
+UPTIME_MIN=$(awk '{printf "%.0f", $1/60}' /proc/uptime 2>/dev/null || echo 0)
 
 # --- ring buffer 管理 ---
 # 既存のstate fileからwindowを読み出し、新エントリを追加、古いのを削除
 if [ -f "$STATE_FILE" ]; then
     # 既存windowを取得（最大WINDOW_SIZE-1エントリ保持）
-    EXISTING_WINDOW=$(python3 -c "
+    EXISTING_WINDOW=$(python -c "
 import json, sys
 try:
     with open('$STATE_FILE') as f:
@@ -76,7 +79,7 @@ fi
 NEW_ENTRY="{\"ts\":\"${CURRENT_TIME}\",\"arousal\":${AROUSAL},\"mem_free\":${MEM_PRESSURE:-0},\"thermal\":${THERMAL:-0}}"
 
 # --- トレンド算出 ---
-TREND_JSON=$(python3 -c "
+TREND_JSON=$(python -c "
 import json
 window = json.loads('${EXISTING_WINDOW}')
 new = ${NEW_ENTRY}

@@ -54,6 +54,21 @@ class TTSMCP:
                 speaker=vv.speaker,
             )
 
+        if self._config.sbv2:
+            from .engines.sbv2 import SBV2Engine
+
+            sb = self._config.sbv2
+            self._engines["sbv2"] = SBV2Engine(
+                url=sb.url,
+                model_id=sb.model_id,
+                model_name=sb.model_name,
+                speaker_id=sb.speaker_id,
+                style=sb.style,
+                style_weight=sb.style_weight,
+                length=sb.length,
+                language=sb.language,
+            )
+
         if not self._engines:
             logger.warning(
                 "No TTS engine configured. Set ELEVENLABS_API_KEY or VOICEVOX_URL."
@@ -123,6 +138,22 @@ class TTSMCP:
                                 "type": "number",
                                 "description": "Pitch shift (VOICEVOX only, -0.15 to 0.15, optional)",
                             },
+                            "sbv2_model_name": {
+                                "type": "string",
+                                "description": "SBV2 model name (optional)",
+                            },
+                            "sbv2_style": {
+                                "type": "string",
+                                "description": "SBV2 voice style name (optional)",
+                            },
+                            "sbv2_style_weight": {
+                                "type": "number",
+                                "description": "SBV2 style strength (optional)",
+                            },
+                            "sbv2_length": {
+                                "type": "number",
+                                "description": "SBV2 speech rate, 1.0=normal (optional)",
+                            },
                             "play_audio": {
                                 "type": "boolean",
                                 "description": "Play audio on this machine (default: true)",
@@ -176,6 +207,15 @@ class TTSMCP:
                         kwargs["speed_scale"] = arguments["speed_scale"]
                     if arguments.get("pitch_scale") is not None:
                         kwargs["pitch_scale"] = arguments["pitch_scale"]
+                elif engine_name == "sbv2":
+                    if arguments.get("sbv2_model_name") is not None:
+                        kwargs["model_name"] = arguments["sbv2_model_name"]
+                    if arguments.get("sbv2_style") is not None:
+                        kwargs["style"] = arguments["sbv2_style"]
+                    if arguments.get("sbv2_style_weight") is not None:
+                        kwargs["style_weight"] = arguments["sbv2_style_weight"]
+                    if arguments.get("sbv2_length") is not None:
+                        kwargs["length"] = arguments["sbv2_length"]
 
                 # Try streaming for ElevenLabs
                 playback_mode = (pb.playback or "auto").strip().lower()

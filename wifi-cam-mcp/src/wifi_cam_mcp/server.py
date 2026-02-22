@@ -32,6 +32,14 @@ class CameraMCPServer:
         self._has_stereo = False
         self._setup_handlers()
 
+    def _pos_tag(self, camera: TapoCamera | None = None) -> str:
+        """Return a short position tag like ' [pan:+30° tilt:+0°]'."""
+        cam = camera or self._camera
+        if cam is None:
+            return ""
+        pos = cam.get_position()
+        return f" [pan:{pos.pan:+.0f}° tilt:{pos.tilt:+.0f}°]"
+
     def _setup_handlers(self) -> None:
         """Set up MCP tool handlers."""
 
@@ -56,10 +64,10 @@ class CameraMCPServer:
                         "properties": {
                             "degrees": {
                                 "type": "integer",
-                                "description": "How far to turn left (1-90 degrees, default: 30)",
+                                "description": "How far to turn left (1-360 degrees, default: 30)",
                                 "default": 30,
                                 "minimum": 1,
-                                "maximum": 90,
+                                "maximum": 360,
                             }
                         },
                         "required": [],
@@ -73,10 +81,10 @@ class CameraMCPServer:
                         "properties": {
                             "degrees": {
                                 "type": "integer",
-                                "description": "How far to turn right (1-90 degrees, default: 30)",
+                                "description": "How far to turn right (1-360 degrees, default: 30)",
                                 "default": 30,
                                 "minimum": 1,
-                                "maximum": 90,
+                                "maximum": 360,
                             }
                         },
                         "required": [],
@@ -90,10 +98,10 @@ class CameraMCPServer:
                         "properties": {
                             "degrees": {
                                 "type": "integer",
-                                "description": "How far to tilt up (1-90 degrees, default: 20)",
+                                "description": "How far to tilt up (1-180 degrees, default: 20)",
                                 "default": 20,
                                 "minimum": 1,
-                                "maximum": 90,
+                                "maximum": 70,
                             }
                         },
                         "required": [],
@@ -107,10 +115,10 @@ class CameraMCPServer:
                         "properties": {
                             "degrees": {
                                 "type": "integer",
-                                "description": "How far to tilt down (1-90 degrees, default: 20)",
+                                "description": "How far to tilt down (1-180 degrees, default: 20)",
                                 "default": 20,
                                 "minimum": 1,
-                                "maximum": 90,
+                                "maximum": 70,
                             }
                         },
                         "required": [],
@@ -119,6 +127,24 @@ class CameraMCPServer:
                 Tool(
                     name="look_around",
                     description="Look around the room by turning your head to see multiple angles (center, left, right, up). Use this when you want to survey your surroundings or get a full view of the room. Returns multiple images from different angles.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="look_front",
+                    description="Return to the front/center position. Use this to reset your head to look straight ahead. Useful as a reference point before looking in other directions.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="get_position",
+                    description="Get your current head position (pan/tilt angles in degrees). Pan: negative=left, positive=right. Tilt: negative=down, positive=up. (0,0) = front center.",
                     inputSchema={
                         "type": "object",
                         "properties": {},
@@ -398,22 +424,22 @@ class CameraMCPServer:
                     case "look_left":
                         degrees = arguments.get("degrees", 30)
                         result = await self._camera.pan_left(degrees)
-                        return [TextContent(type="text", text=result.message)]
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
 
                     case "look_right":
                         degrees = arguments.get("degrees", 30)
                         result = await self._camera.pan_right(degrees)
-                        return [TextContent(type="text", text=result.message)]
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
 
                     case "look_up":
                         degrees = arguments.get("degrees", 20)
                         result = await self._camera.tilt_up(degrees)
-                        return [TextContent(type="text", text=result.message)]
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
 
                     case "look_down":
                         degrees = arguments.get("degrees", 20)
                         result = await self._camera.tilt_down(degrees)
-                        return [TextContent(type="text", text=result.message)]
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
 
                     case "look_around":
                         captures = await self._camera.look_around()
@@ -434,10 +460,27 @@ class CameraMCPServer:
                         contents.append(
                             TextContent(
                                 type="text",
-                                text=f"Captured {len(captures)} angles. Camera returned to center position.",
+                                text=f"Captured {len(captures)} angles. Camera returned to center position.{self._pos_tag()}",
                             )
                         )
                         return contents
+
+                    case "look_front":
+                        result = await self._camera.look_front()
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
+
+                    case "get_position":
+                        pos = self._camera.get_position()
+                        hw_pos = await self._camera.get_hw_position()
+                        text = f"Position: pan={pos.pan:+.0f}°, tilt={pos.tilt:+.0f}°"
+                        if hw_pos:
+                            hw_pan_deg = hw_pos.pan * 180.0
+                            hw_tilt_deg = hw_pos.tilt * 90.0
+                            text += (
+                                f"\nHardware: pan={hw_pan_deg:+.1f}°,"
+                                f" tilt={hw_tilt_deg:+.1f}°"
+                            )
+                        return [TextContent(type="text", text=text)]
 
                     case "camera_info":
                         info = await self._camera.get_device_info()
@@ -460,7 +503,7 @@ class CameraMCPServer:
                     case "camera_go_to_preset":
                         preset_id = arguments.get("preset_id", "")
                         result = await self._camera.go_to_preset(preset_id)
-                        return [TextContent(type="text", text=result.message)]
+                        return [TextContent(type="text", text=result.message + self._pos_tag())]
 
                     case "listen":
                         duration = min(arguments.get("duration", 5), 30)
@@ -532,7 +575,7 @@ class CameraMCPServer:
                             ]
                         degrees = arguments.get("degrees", 30)
                         result = await self._camera_right.pan_left(degrees)
-                        return [TextContent(type="text", text=f"Right eye: {result.message}")]
+                        return [TextContent(type="text", text=f"Right eye: {result.message}{self._pos_tag(self._camera_right)}")]
 
                     case "right_eye_look_right":
                         if not self._camera_right:
@@ -541,7 +584,7 @@ class CameraMCPServer:
                             ]
                         degrees = arguments.get("degrees", 30)
                         result = await self._camera_right.pan_right(degrees)
-                        return [TextContent(type="text", text=f"Right eye: {result.message}")]
+                        return [TextContent(type="text", text=f"Right eye: {result.message}{self._pos_tag(self._camera_right)}")]
 
                     case "right_eye_look_up":
                         if not self._camera_right:
@@ -550,7 +593,7 @@ class CameraMCPServer:
                             ]
                         degrees = arguments.get("degrees", 20)
                         result = await self._camera_right.tilt_up(degrees)
-                        return [TextContent(type="text", text=f"Right eye: {result.message}")]
+                        return [TextContent(type="text", text=f"Right eye: {result.message}{self._pos_tag(self._camera_right)}")]
 
                     case "right_eye_look_down":
                         if not self._camera_right:
@@ -559,7 +602,7 @@ class CameraMCPServer:
                             ]
                         degrees = arguments.get("degrees", 20)
                         result = await self._camera_right.tilt_down(degrees)
-                        return [TextContent(type="text", text=f"Right eye: {result.message}")]
+                        return [TextContent(type="text", text=f"Right eye: {result.message}{self._pos_tag(self._camera_right)}")]
 
                     case "both_eyes_look_left":
                         if not self._camera_right:
@@ -572,7 +615,7 @@ class CameraMCPServer:
                         await asyncio.gather(left_task, right_task)
                         return [
                             TextContent(
-                                type="text", text=f"Both eyes moved left by {degrees} degrees"
+                                type="text", text=f"Both eyes moved left by {degrees} degrees{self._pos_tag()}"
                             )
                         ]
 
@@ -587,7 +630,7 @@ class CameraMCPServer:
                         await asyncio.gather(left_task, right_task)
                         return [
                             TextContent(
-                                type="text", text=f"Both eyes moved right by {degrees} degrees"
+                                type="text", text=f"Both eyes moved right by {degrees} degrees{self._pos_tag()}"
                             )
                         ]
 
@@ -602,7 +645,7 @@ class CameraMCPServer:
                         await asyncio.gather(left_task, right_task)
                         return [
                             TextContent(
-                                type="text", text=f"Both eyes tilted up by {degrees} degrees"
+                                type="text", text=f"Both eyes tilted up by {degrees} degrees{self._pos_tag()}"
                             )
                         ]
 
@@ -617,7 +660,7 @@ class CameraMCPServer:
                         await asyncio.gather(left_task, right_task)
                         return [
                             TextContent(
-                                type="text", text=f"Both eyes tilted down by {degrees} degrees"
+                                type="text", text=f"Both eyes tilted down by {degrees} degrees{self._pos_tag()}"
                             )
                         ]
 

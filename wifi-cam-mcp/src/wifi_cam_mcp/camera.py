@@ -247,7 +247,12 @@ class TapoCamera:
     # Image capture
     # ------------------------------------------------------------------
 
-    async def capture_image(self, save_to_file: bool = True) -> CaptureResult:
+    async def capture_image(
+        self,
+        save_to_file: bool = True,
+        max_width: int | None = None,
+        max_height: int | None = None,
+    ) -> CaptureResult:
         """Capture a snapshot from the camera.
 
         First tries ONVIF snapshot (fast, ~300ms). Falls back to RTSP
@@ -255,13 +260,22 @@ class TapoCamera:
 
         Args:
             save_to_file: If True, save image to disk as well
+            max_width: Override max width (defaults to config value)
+            max_height: Override max height (defaults to config value)
 
         Returns:
             CaptureResult with base64 encoded image and metadata
         """
-        return await self._with_reconnect(self._capture_image_impl, save_to_file)
+        return await self._with_reconnect(
+            self._capture_image_impl, save_to_file, max_width, max_height
+        )
 
-    async def _capture_image_impl(self, save_to_file: bool) -> CaptureResult:
+    async def _capture_image_impl(
+        self,
+        save_to_file: bool,
+        max_width: int | None = None,
+        max_height: int | None = None,
+    ) -> CaptureResult:
         """Internal capture implementation."""
         # Try ONVIF snapshot first
         onvif_error = None
@@ -287,9 +301,11 @@ class TapoCamera:
             image = image.rotate(180)
 
         # Resize if needed
-        if image.width > self._config.max_width or image.height > self._config.max_height:
+        w_limit = max_width or self._config.max_width
+        h_limit = max_height or self._config.max_height
+        if image.width > w_limit or image.height > h_limit:
             image.thumbnail(
-                (self._config.max_width, self._config.max_height),
+                (w_limit, h_limit),
                 Image.LANCZOS,
             )
 
@@ -416,7 +432,7 @@ class TapoCamera:
 
     async def _move_impl(self, direction: Direction, degrees: int) -> MoveResult:
         """Internal move implementation."""
-        degrees = max(1, min(degrees, 90))
+        degrees = max(1, min(degrees, 360))
 
         # Convert degrees to ONVIF normalized values
         pan_delta = 0.0
@@ -429,11 +445,10 @@ class TapoCamera:
             case Direction.RIGHT:
                 pan_delta = -_degrees_to_normalized_pan(degrees)
             case Direction.UP:
-                # Tapo C220 ONVIF: y+ = physical DOWN, y- = physical UP
-                # (confirmed: y=1.0 is the lower limit when desk-mounted)
-                tilt_delta = -_degrees_to_normalized_tilt(degrees)
-            case Direction.DOWN:
+                # Tapo C210 ONVIF: y+ = physical UP, y- = physical DOWN
                 tilt_delta = _degrees_to_normalized_tilt(degrees)
+            case Direction.DOWN:
+                tilt_delta = -_degrees_to_normalized_tilt(degrees)
 
         # In ceiling mount mode the camera is upside-down:
         # - Tilt inverts (y=+1.0 becomes the upper limit)
@@ -514,6 +529,67 @@ class TapoCamera:
             logger.debug("Failed to get hardware position: %s", e)
         return None
 
+    async def absolute_move(
+        self, pan_degrees: float = 0.0, tilt_degrees: float = 0.0
+    ) -> MoveResult:
+        """Move camera to an absolute position via ONVIF AbsoluteMove.
+
+        Args:
+            pan_degrees: Target pan in degrees (-180 to +180, 0 = center).
+            tilt_degrees: Target tilt in degrees (-90 to +90, 0 = center).
+
+        Returns:
+            MoveResult with operation status.
+        """
+        return await self._with_reconnect(
+            self._absolute_move_impl, pan_degrees, tilt_degrees
+        )
+
+    async def _absolute_move_impl(
+        self, pan_degrees: float, tilt_degrees: float
+    ) -> MoveResult:
+        """Internal absolute move implementation."""
+        pan_norm = _degrees_to_normalized_pan(pan_degrees)
+        tilt_norm = _degrees_to_normalized_tilt(tilt_degrees)
+
+        if self._config.mount_mode == "ceiling":
+            pan_norm = -pan_norm
+            tilt_norm = -tilt_norm
+
+        try:
+            await self._ptz_service.AbsoluteMove(
+                {
+                    "ProfileToken": self._profile_token,
+                    "Position": {
+                        "PanTilt": {"x": pan_norm, "y": tilt_norm},
+                    },
+                }
+            )
+
+            # Sync software tracking
+            self._sw_position.pan = pan_degrees
+            self._sw_position.tilt = tilt_degrees
+
+            await asyncio.sleep(1.0)
+
+            return MoveResult(
+                direction=Direction.LEFT,
+                degrees=0,
+                success=True,
+                message=f"Moved to pan={pan_degrees:.0f}°, tilt={tilt_degrees:.0f}°",
+            )
+        except Exception as e:
+            return MoveResult(
+                direction=Direction.LEFT,
+                degrees=0,
+                success=False,
+                message=f"Failed to move to absolute position: {e!s}",
+            )
+
+    async def look_front(self) -> MoveResult:
+        """Move camera to front/center position (pan=0, tilt=0)."""
+        return await self.absolute_move(0.0, 0.0)
+
     def reset_position_tracking(self) -> None:
         """Reset software position tracking to center (0, 0)."""
         self._sw_position = CameraPosition()
@@ -534,30 +610,41 @@ class TapoCamera:
         """Tilt camera downward."""
         return await self.move(Direction.DOWN, degrees)
 
-    async def look_around(self) -> list[CaptureResult]:
+    async def look_around(
+        self,
+        max_width: int | None = None,
+        max_height: int | None = None,
+    ) -> list[CaptureResult]:
         """Look around the room by capturing multiple angles.
 
         Captures: center, left, right, up-center positions.
+        Uses lower resolution by default (640x360) for quick overview.
+
+        Args:
+            max_width: Override max width per image (default: 640)
+            max_height: Override max height per image (default: 360)
 
         Returns:
             List of CaptureResults from different angles
         """
+        w = max_width or 640
+        h = max_height or 360
         captures: list[CaptureResult] = []
 
-        center = await self.capture_image()
+        center = await self.capture_image(max_width=w, max_height=h)
         captures.append(center)
 
         await self.pan_left(45)
-        left = await self.capture_image()
+        left = await self.capture_image(max_width=w, max_height=h)
         captures.append(left)
 
         await self.pan_right(90)
-        right = await self.capture_image()
+        right = await self.capture_image(max_width=w, max_height=h)
         captures.append(right)
 
         await self.pan_left(45)
         await self.tilt_up(20)
-        up = await self.capture_image()
+        up = await self.capture_image(max_width=w, max_height=h)
         captures.append(up)
 
         await self.tilt_down(20)
@@ -635,10 +722,10 @@ class TapoCamera:
         """
         await self._ensure_connected()
 
-        rtsp_url = self._get_rtsp_url()
+        rtsp_url = self._config.listen_url or self._get_rtsp_url()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = str(self._capture_dir / f"audio_{timestamp}.wav")
+        file_path = str((self._capture_dir / f"audio_{timestamp}.wav").resolve())
 
         try:
             cmd = [
@@ -663,9 +750,11 @@ class TapoCamera:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(process.wait(), timeout=duration + 10.0)
+            _, stderr_data = await asyncio.wait_for(process.communicate(), timeout=duration + 10.0)
+            if process.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed (exit {process.returncode}): {stderr_data.decode(errors='replace')}")
 
             with open(file_path, "rb") as f:
                 audio_data = f.read()
@@ -684,7 +773,7 @@ class TapoCamera:
                 transcript=transcript,
             )
         except Exception as e:
-            raise RuntimeError(f"Failed to record audio: {e!s}") from e
+            raise RuntimeError(f"Failed to record audio: {type(e).__name__}: {e!s} | cmd={cmd} | file_path={file_path}") from e
 
     async def _transcribe_audio(self, audio_path: str) -> str | None:
         """Transcribe audio file using OpenAI Whisper.

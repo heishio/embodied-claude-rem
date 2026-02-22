@@ -12,7 +12,7 @@ from memory_mcp.memory import MemoryStore
 @pytest.fixture
 def temp_db_path(tmp_path: Path) -> str:
     """Create a temporary database path."""
-    return str(tmp_path / "test_chroma")
+    return str(tmp_path / "test_memory.db")
 
 
 @pytest.fixture

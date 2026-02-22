@@ -10,9 +10,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
-    "chromadb>=0.5.0",
     "python-dotenv>=1.0.0",
     "Pillow>=10.0.0",
+    "sentence-transformers>=2.0.0",
+    "rank-bm25>=0.2.2",
+    "sudachipy>=0.6.10",
+    "sudachidict-core>=20260116",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
@@ -39,3 +43,6 @@ per-file-ignores = {"src/memory_mcp/server.py" = ["E501"]}
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = []

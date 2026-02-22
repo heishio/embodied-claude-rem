@@ -15,7 +15,10 @@
     },
     "memory": {
       "command": "uv",
-      "args": ["run", "--directory", "memory-mcp", "memory-mcp"]
+      "args": ["run", "--directory", "memory-mcp", "memory-mcp"],
+      "env": {
+        "TOM_DEFAULT_PERSON": "シオ"
+      }
     },
     "system-temperature": {
       "command": "uv",
@@ -32,6 +35,10 @@
         "GO2RTC_URL": "http://localhost:1984",
         "GO2RTC_STREAM": "tapo_cam"
       }
+    },
+    "desire-system": {
+      "command": "uv",
+      "args": ["run", "--directory", "desire-system", "desire-system"]
     }
   }
 }

@@ -67,6 +67,37 @@ class VoicevoxConfig:
 
 
 @dataclass(frozen=True)
+class SBV2Config:
+    """Style-Bert-VITS2-specific configuration."""
+
+    url: str
+    model_id: int
+    model_name: str | None
+    speaker_id: int
+    style: str
+    style_weight: float
+    length: float
+    language: str
+
+    @classmethod
+    def from_env(cls) -> "SBV2Config | None":
+        """Create config from environment variables. Returns None if not configured."""
+        url = os.getenv("SBV2_API_URL", "") or os.getenv("SBV2_URL", "")
+        if not url:
+            return None
+        return cls(
+            url=url.rstrip("/"),
+            model_id=int(os.getenv("SBV2_MODEL_ID", "0")),
+            model_name=os.getenv("SBV2_MODEL_NAME") or None,
+            speaker_id=int(os.getenv("SBV2_SPEAKER_ID", "0")),
+            style=os.getenv("SBV2_STYLE", "Neutral"),
+            style_weight=float(os.getenv("SBV2_STYLE_WEIGHT", "5.0")),
+            length=float(os.getenv("SBV2_LENGTH", "1.0")),
+            language=os.getenv("SBV2_LANGUAGE", "JP"),
+        )
+
+
+@dataclass(frozen=True)
 class PlaybackConfig:
     """Playback and go2rtc configuration (shared across engines)."""
 
@@ -129,6 +160,7 @@ class TTSConfig:
     default_engine: str | None
     elevenlabs: ElevenLabsConfig | None
     voicevox: VoicevoxConfig | None
+    sbv2: SBV2Config | None
     playback: PlaybackConfig
 
     @classmethod
@@ -138,6 +170,7 @@ class TTSConfig:
             default_engine=os.getenv("TTS_DEFAULT_ENGINE") or None,
             elevenlabs=ElevenLabsConfig.from_env(),
             voicevox=VoicevoxConfig.from_env(),
+            sbv2=SBV2Config.from_env(),
             playback=PlaybackConfig.from_env(),
         )
 
@@ -147,7 +180,7 @@ class TTSConfig:
         Priority:
         1. Explicit request (from tool call)
         2. TTS_DEFAULT_ENGINE env var
-        3. Auto-detect (elevenlabs first for backward compat, then voicevox)
+        3. Auto-detect (elevenlabs first for backward compat, then voicevox, then sbv2)
         """
         if requested:
             return requested
@@ -157,7 +190,11 @@ class TTSConfig:
             return "elevenlabs"
         if self.voicevox:
             return "voicevox"
-        raise ValueError("No TTS engine configured. Set ELEVENLABS_API_KEY or VOICEVOX_URL.")
+        if self.sbv2:
+            return "sbv2"
+        raise ValueError(
+            "No TTS engine configured. Set ELEVENLABS_API_KEY, VOICEVOX_URL, or SBV2_URL."
+        )
 
 
 @dataclass(frozen=True)

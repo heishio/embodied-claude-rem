@@ -1,14 +1,15 @@
 """Tests for SensoryIntegration."""
 
+import os
 import shutil
 import tempfile
 
 import pytest
 
-from src.memory_mcp.config import MemoryConfig
-from src.memory_mcp.memory import MemoryStore
-from src.memory_mcp.sensory import SensoryIntegration
-from src.memory_mcp.types import CameraPosition
+from memory_mcp.config import MemoryConfig
+from memory_mcp.memory import MemoryStore
+from memory_mcp.sensory import SensoryIntegration
+from memory_mcp.types import CameraPosition
 
 
 @pytest.fixture
@@ -16,9 +17,10 @@ async def memory_store():
     """Create a MemoryStore instance for testing with isolated temp DB."""
     # Create unique temp directory for each test
     temp_dir = tempfile.mkdtemp(prefix="test_sensory_")
+    db_path = os.path.join(temp_dir, "test_memory.db")
 
     config = MemoryConfig(
-        db_path=temp_dir,
+        db_path=db_path,
         collection_name="test_memories",
     )
     store = MemoryStore(config)

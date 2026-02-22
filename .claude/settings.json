@@ -5,8 +5,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/interoception.sh",
-            "timeout": 5
+            "command": "C:/Users/sep61/ClaudeCode/embodied-claude/.claude/hooks/run-interoception.cmd",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "C:/Users/sep61/ClaudeCode/embodied-claude/.claude/hooks/run-keyword-buffer.cmd",
+            "timeout": 15
           }
         ]
       }

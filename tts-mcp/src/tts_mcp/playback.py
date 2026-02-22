@@ -2,16 +2,40 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess
 import time
 import urllib.request
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import quote
+
+# カメラスピーカー再生時の末尾バッファリング途切れ対策（秒）
+_SILENCE_PADDING_SECONDS = 0.3
+
+
+def _append_silence_to_wav(wav_bytes: bytes, seconds: float) -> bytes:
+    """WAVデータの末尾に無音を追加する。"""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as r:
+            params = r.getparams()
+            frames = r.readframes(params.nframes)
+
+        silence_frames = int(params.framerate * seconds) * params.nchannels * params.sampwidth
+        silence = b"\x00" * silence_frames
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setparams(params)
+            w.writeframes(frames + silence)
+        return buf.getvalue()
+    except Exception:
+        return wav_bytes
 
 
 def save_audio(audio_bytes: bytes, audio_format: str, save_dir: str) -> str:
@@ -244,6 +268,58 @@ def play_audio(
 # Camera speaker via go2rtc
 # ---------------------------------------------------------------------------
 
+def _send_audio_to_stream(
+    abs_path: str,
+    go2rtc_url: str,
+    stream_name: str,
+) -> tuple[bool, str]:
+    """Send audio to a specific go2rtc stream. Returns (success, message)."""
+    src = f"ffmpeg:{abs_path}#audio=pcma#input=file"
+    url = (
+        f"{go2rtc_url}/api/streams"
+        f"?dst={quote(stream_name, safe='')}"
+        f"&src={quote(src, safe='')}"
+    )
+
+    req = urllib.request.Request(url, method="POST", data=b"")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read())
+
+    has_sender = False
+    for consumer in body.get("consumers", []):
+        if consumer.get("senders"):
+            has_sender = True
+            break
+
+    if not has_sender:
+        return False, "no audio sender established"
+
+    ffmpeg_producer_id = None
+    for p in body.get("producers", []):
+        if p.get("format_name") == "wav" or "ffmpeg" in p.get("source", ""):
+            ffmpeg_producer_id = p.get("id")
+            break
+
+    if ffmpeg_producer_id:
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                status_url = f"{go2rtc_url}/api/streams"
+                with urllib.request.urlopen(status_url, timeout=5) as r:
+                    streams = json.loads(r.read())
+                stream = streams.get(stream_name, {})
+                still_playing = any(
+                    p.get("id") == ffmpeg_producer_id
+                    for p in stream.get("producers", [])
+                )
+                if not still_playing:
+                    break
+            except Exception:
+                break
+
+    return True, f"played via go2rtc → {stream_name}"
+
+
 def play_with_go2rtc(
     file_path: str,
     go2rtc_url: str,
@@ -253,49 +329,29 @@ def play_with_go2rtc(
     """Play audio through camera speaker via go2rtc backchannel."""
     try:
         abs_path = os.path.abspath(file_path)
-        src = f"ffmpeg:{abs_path}#audio=pcma#input=file"
-        url = (
-            f"{go2rtc_url}/api/streams"
-            f"?dst={quote(go2rtc_stream, safe='')}"
-            f"&src={quote(src, safe='')}"
-        )
 
-        req = urllib.request.Request(url, method="POST", data=b"")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read())
+        # WAVファイルなら末尾に無音パディングを追加（バッファリング途切れ対策）
+        if abs_path.lower().endswith(".wav"):
+            with open(abs_path, "rb") as f:
+                original = f.read()
+            padded = _append_silence_to_wav(original, _SILENCE_PADDING_SECONDS)
+            if padded is not original:
+                with open(abs_path, "wb") as f:
+                    f.write(padded)
 
-        has_sender = False
-        for consumer in body.get("consumers", []):
-            if consumer.get("senders"):
-                has_sender = True
-                break
+        # Try backchannel stream first (tapo:// only, bypasses RTSP backchannel)
+        bc_stream = f"{go2rtc_stream}_bc"
+        try:
+            ok, msg = _send_audio_to_stream(abs_path, go2rtc_url, bc_stream)
+            if ok:
+                return True, msg
+        except Exception:
+            pass
 
-        if not has_sender:
-            return False, "go2rtc: no audio sender established (camera may not support backchannel)"
-
-        ffmpeg_producer_id = None
-        for p in body.get("producers", []):
-            if p.get("format_name") == "wav" or "ffmpeg" in p.get("source", ""):
-                ffmpeg_producer_id = p.get("id")
-                break
-
-        if ffmpeg_producer_id:
-            for _ in range(60):
-                time.sleep(0.5)
-                try:
-                    status_url = f"{go2rtc_url}/api/streams"
-                    with urllib.request.urlopen(status_url, timeout=5) as r:
-                        streams = json.loads(r.read())
-                    stream = streams.get(go2rtc_stream, {})
-                    still_playing = any(
-                        p.get("id") == ffmpeg_producer_id
-                        for p in stream.get("producers", [])
-                    )
-                    if not still_playing:
-                        break
-                except Exception:
-                    break
-
-        return True, f"played via go2rtc → {go2rtc_stream}"
+        # Fall back to main stream (RTSP backchannel)
+        ok, msg = _send_audio_to_stream(abs_path, go2rtc_url, go2rtc_stream)
+        if ok:
+            return True, msg
+        return False, f"go2rtc: {msg} (camera may not support backchannel)"
     except Exception as exc:
         return False, f"go2rtc failed: {exc}"

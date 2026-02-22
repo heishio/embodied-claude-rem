@@ -1,9 +1,14 @@
 """MCP Server for AI Long-term Memory - Let AI remember across sessions!"""
 
 import asyncio
+import base64
 import json
 import logging
+import os
+import tempfile
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server import Server
@@ -12,12 +17,24 @@ from mcp.types import TextContent, Tool
 
 from .config import MemoryConfig, ServerConfig
 from .episode import EpisodeManager
+from .graph import MemoryGraph
 from .memory import MemoryStore
 from .sensory import SensoryIntegration
-from .types import CameraPosition
+from .types import CameraPosition, VerbChain, VerbStep
+from .verb_chain import VerbChainStore, crystallize_buffer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_PRIVATE_KEY = "quo-inner-voice"
+
+
+def _xor_encrypt(text: str, key: str = _PRIVATE_KEY) -> str:
+    """Simple XOR + base64 encryption for private introspection files."""
+    key_bytes = key.encode("utf-8")
+    text_bytes = text.encode("utf-8")
+    encrypted = bytes(b ^ key_bytes[i % len(key_bytes)] for i, b in enumerate(text_bytes))
+    return base64.b64encode(encrypted).decode("ascii")
 
 
 class MemoryMCPServer:
@@ -28,6 +45,8 @@ class MemoryMCPServer:
         self._memory_store: MemoryStore | None = None
         self._episode_manager: EpisodeManager | None = None  # Phase 4.2
         self._sensory_integration: SensoryIntegration | None = None  # Phase 4.3
+        self._verb_chain_store: VerbChainStore | None = None
+        self._memory_graph: MemoryGraph | None = None
         self._server_config = ServerConfig.from_env()
         self._setup_handlers()
 
@@ -40,7 +59,7 @@ class MemoryMCPServer:
             return [
                 Tool(
                     name="remember",
-                    description="Save a memory to long-term storage. Use this to remember important things, experiences, conversations, or learnings.",
+                    description="Save a memory to long-term storage. Use this to remember important things, experiences, conversations, or learnings. Can also save visual memories (with image_path + camera_position) or audio memories (with audio_path + transcript).",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -65,7 +84,7 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": "Category of memory",
                                 "default": "daily",
-                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation"],
+                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation", "curiosity"],
                             },
                             "auto_link": {
                                 "type": "boolean",
@@ -78,6 +97,34 @@ class MemoryMCPServer:
                                 "default": 0.8,
                                 "minimum": 0,
                                 "maximum": 2,
+                            },
+                            "image_path": {
+                                "type": "string",
+                                "description": "Path to image file (for visual memory)",
+                            },
+                            "camera_position": {
+                                "type": "object",
+                                "description": "Camera pan/tilt position (for visual memory)",
+                                "properties": {
+                                    "pan_angle": {"type": "integer", "description": "Pan angle (-90 to +90)"},
+                                    "tilt_angle": {"type": "integer", "description": "Tilt angle (-90 to +90)"},
+                                    "preset_id": {"type": "string", "description": "Preset ID (optional)"},
+                                },
+                                "required": ["pan_angle", "tilt_angle"],
+                            },
+                            "resolution": {
+                                "type": "string",
+                                "description": "Image resolution: 'low' (160x120), 'medium' (320x240), 'high' (640x480)",
+                                "default": "medium",
+                                "enum": ["low", "medium", "high"],
+                            },
+                            "audio_path": {
+                                "type": "string",
+                                "description": "Path to audio file (for audio memory)",
+                            },
+                            "transcript": {
+                                "type": "string",
+                                "description": "Transcribed text from audio",
                             },
                         },
                         "required": ["content"],
@@ -108,7 +155,7 @@ class MemoryMCPServer:
                             "category_filter": {
                                 "type": "string",
                                 "description": "Filter by category (optional)",
-                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation"],
+                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation", "curiosity"],
                             },
                             "date_from": {
                                 "type": "string",
@@ -124,7 +171,7 @@ class MemoryMCPServer:
                 ),
                 Tool(
                     name="recall",
-                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant.",
+                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant. Set chain_depth >= 1 to also include linked/associated memories.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -138,6 +185,13 @@ class MemoryMCPServer:
                                 "default": 3,
                                 "minimum": 1,
                                 "maximum": 10,
+                            },
+                            "chain_depth": {
+                                "type": "integer",
+                                "description": "How many levels of linked memories to follow (0=none, 1-3=with associations)",
+                                "default": 0,
+                                "minimum": 0,
+                                "maximum": 3,
                             },
                         },
                         "required": ["context"],
@@ -159,49 +213,19 @@ class MemoryMCPServer:
                             "category_filter": {
                                 "type": "string",
                                 "description": "Filter by category (optional)",
-                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation"],
+                                "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation", "curiosity"],
                             },
                         },
                         "required": [],
                     },
                 ),
-                Tool(
-                    name="get_memory_stats",
-                    description="Get statistics about stored memories. Shows total count, breakdown by category and emotion.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
-                ),
-                Tool(
-                    name="recall_with_associations",
-                    description="Recall memories with their associated/linked memories. Returns the primary memories plus any memories linked to them.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "context": {
-                                "type": "string",
-                                "description": "Current context or topic",
-                            },
-                            "n_results": {
-                                "type": "integer",
-                                "description": "Number of primary memories to recall",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 10,
-                            },
-                            "chain_depth": {
-                                "type": "integer",
-                                "description": "How many levels of links to follow (1-3)",
-                                "default": 1,
-                                "minimum": 1,
-                                "maximum": 3,
-                            },
-                        },
-                        "required": ["context"],
-                    },
-                ),
+                # --- Disabled tools (rarely used) ---
+                # Tool(
+                #     name="get_memory_stats",
+                #     description="Get statistics about stored memories.",
+                #     inputSchema={"type": "object", "properties": {}, "required": []},
+                # ),
+                # recall_with_associations: merged into recall with chain_depth param
                 Tool(
                     name="recall_divergent",
                     description="Recall memories with divergent associative thinking. Expands memory candidates and selects them through workspace-style competition.",
@@ -249,27 +273,7 @@ class MemoryMCPServer:
                         "required": ["context"],
                     },
                 ),
-                Tool(
-                    name="get_association_diagnostics",
-                    description="Inspect associative expansion diagnostics for a given context without committing activation updates.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "context": {
-                                "type": "string",
-                                "description": "Context used to probe associative expansion",
-                            },
-                            "sample_size": {
-                                "type": "integer",
-                                "description": "Sample size for diagnostic probing",
-                                "default": 20,
-                                "minimum": 3,
-                                "maximum": 20,
-                            },
-                        },
-                        "required": ["context"],
-                    },
-                ),
+                # get_association_diagnostics: disabled (debug only)
                 Tool(
                     name="consolidate_memories",
                     description="Run a manual replay/consolidation cycle to strengthen associations and refresh activation metadata.",
@@ -301,237 +305,12 @@ class MemoryMCPServer:
                         "required": [],
                     },
                 ),
-                Tool(
-                    name="get_memory_chain",
-                    description="Get a memory and all memories linked to it. Useful for exploring related memories.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "memory_id": {
-                                "type": "string",
-                                "description": "ID of the starting memory",
-                            },
-                            "depth": {
-                                "type": "integer",
-                                "description": "How deep to follow links",
-                                "default": 2,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                        },
-                        "required": ["memory_id"],
-                    },
-                ),
-                # Phase 4: Episode Memory Tools
-                Tool(
-                    name="create_episode",
-                    description="Create an episode from recent memories. Use this to group related experiences into a story (e.g., 'Morning sky search').",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "type": "string",
-                                "description": "Episode title (e.g., 'Morning sky search')",
-                            },
-                            "memory_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of memory IDs to include in the episode",
-                            },
-                            "participants": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "People involved in the episode (optional)",
-                                "default": [],
-                            },
-                            "auto_summarize": {
-                                "type": "boolean",
-                                "description": "Auto-generate summary from memories",
-                                "default": True,
-                            },
-                        },
-                        "required": ["title", "memory_ids"],
-                    },
-                ),
-                Tool(
-                    name="search_episodes",
-                    description="Search through past episodes. Find a sequence of experiences by topic.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query for episodes",
-                            },
-                            "n_results": {
-                                "type": "integer",
-                                "description": "Maximum number of results",
-                                "default": 5,
-                                "minimum": 1,
-                                "maximum": 20,
-                            },
-                        },
-                        "required": ["query"],
-                    },
-                ),
-                Tool(
-                    name="get_episode_memories",
-                    description="Get all memories in a specific episode, in chronological order.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "episode_id": {
-                                "type": "string",
-                                "description": "Episode ID",
-                            },
-                        },
-                        "required": ["episode_id"],
-                    },
-                ),
-                # Phase 4.3: Sensory Integration Tools
-                Tool(
-                    name="save_visual_memory",
-                    description="Save a memory with visual data (image path and camera position). Use this when you see something with your camera.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "Memory content (e.g., 'Found the morning sky')",
-                            },
-                            "image_path": {
-                                "type": "string",
-                                "description": "Path to the captured image file",
-                            },
-                            "camera_position": {
-                                "type": "object",
-                                "description": "Camera pan/tilt position",
-                                "properties": {
-                                    "pan_angle": {
-                                        "type": "integer",
-                                        "description": "Pan angle (-90 to +90)",
-                                    },
-                                    "tilt_angle": {
-                                        "type": "integer",
-                                        "description": "Tilt angle (-90 to +90)",
-                                    },
-                                    "preset_id": {
-                                        "type": "string",
-                                        "description": "Preset ID (optional)",
-                                    },
-                                },
-                                "required": ["pan_angle", "tilt_angle"],
-                            },
-                            "emotion": {
-                                "type": "string",
-                                "description": "Emotion",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
-                            },
-                            "importance": {
-                                "type": "integer",
-                                "description": "Importance (1-5)",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                            "resolution": {
-                                "type": "string",
-                                "description": "Image resolution for memory storage: 'low' (160x120), 'medium' (320x240, default), 'high' (640x480)",
-                                "default": "medium",
-                                "enum": ["low", "medium", "high"],
-                            },
-                        },
-                        "required": ["content", "image_path", "camera_position"],
-                    },
-                ),
-                Tool(
-                    name="save_audio_memory",
-                    description="Save a memory with audio data (audio file path and transcript). Use this when you hear something.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "Memory content (e.g., 'Heard a greeting')",
-                            },
-                            "audio_path": {
-                                "type": "string",
-                                "description": "Path to the audio file",
-                            },
-                            "transcript": {
-                                "type": "string",
-                                "description": "Transcribed text from audio (e.g., from Whisper)",
-                            },
-                            "emotion": {
-                                "type": "string",
-                                "description": "Emotion",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
-                            },
-                            "importance": {
-                                "type": "integer",
-                                "description": "Importance (1-5)",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                        },
-                        "required": ["content", "audio_path", "transcript"],
-                    },
-                ),
-                Tool(
-                    name="recall_by_camera_position",
-                    description="Recall memories by camera direction. Find what you saw when looking in a specific direction.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "pan_angle": {
-                                "type": "integer",
-                                "description": "Pan angle (-90 to +90)",
-                            },
-                            "tilt_angle": {
-                                "type": "integer",
-                                "description": "Tilt angle (-90 to +90)",
-                            },
-                            "tolerance": {
-                                "type": "integer",
-                                "description": "Angle tolerance (default ±15 degrees)",
-                                "default": 15,
-                                "minimum": 1,
-                                "maximum": 90,
-                            },
-                        },
-                        "required": ["pan_angle", "tilt_angle"],
-                    },
-                ),
-                # Phase 4.4: Working Memory Tools
-                Tool(
-                    name="get_working_memory",
-                    description="Get recent memories from working memory buffer (fast access). Use this to quickly recall what just happened.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "n_results": {
-                                "type": "integer",
-                                "description": "Number of recent memories to get",
-                                "default": 10,
-                                "minimum": 1,
-                                "maximum": 20,
-                            },
-                        },
-                        "required": [],
-                    },
-                ),
-                Tool(
-                    name="refresh_working_memory",
-                    description="Refresh working memory with important and frequently accessed memories from long-term storage.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                    },
-                ),
+                # get_memory_chain: disabled (rarely used)
+                # Episode tools: disabled (use MEMORY.md for diary-like entries)
+                # create_episode, search_episodes, get_episode_memories
+                # save_visual_memory, save_audio_memory: merged into remember
+                # recall_by_camera_position: disabled (rarely used)
+                # get_working_memory, refresh_working_memory: disabled (rarely used)
                 # Phase 5: Causal Links
                 Tool(
                     name="link_memories",
@@ -561,33 +340,7 @@ class MemoryMCPServer:
                         "required": ["source_id", "target_id"],
                     },
                 ),
-                Tool(
-                    name="get_causal_chain",
-                    description="Trace the causal chain of a memory. Find what caused this memory (backward) or what it led to (forward).",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "memory_id": {
-                                "type": "string",
-                                "description": "ID of the starting memory",
-                            },
-                            "direction": {
-                                "type": "string",
-                                "description": "Direction to trace: 'backward' (find causes) or 'forward' (find effects)",
-                                "default": "backward",
-                                "enum": ["backward", "forward"],
-                            },
-                            "max_depth": {
-                                "type": "integer",
-                                "description": "How deep to trace the chain (1-5)",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                        },
-                        "required": ["memory_id"],
-                    },
-                ),
+                # get_causal_chain: disabled (rarely used)
                 Tool(
                     name="tom",
                     description="Theory of Mind: perspective-taking tool. Call this BEFORE responding to understand what the other person is feeling and wanting. Projects your simulated emotions onto them, then swaps perspectives.",
@@ -600,11 +353,172 @@ class MemoryMCPServer:
                             },
                             "person": {
                                 "type": "string",
-                                "description": "Who you are talking to (default: コウタ)",
-                                "default": "コウタ",
+                                "description": f"Who you are talking to (default: {self._server_config.tom_default_person})",
+                                "default": self._server_config.tom_default_person,
+                            },
+                            "private": {
+                                "type": "boolean",
+                                "description": "If true, write result to a temp file and return only the file path (for private introspection)",
+                                "default": False,
                             },
                         },
                         "required": ["situation"],
+                    },
+                ),
+                # Verb Chain Tools
+                Tool(
+                    name="crystallize",
+                    description="Convert the sensory buffer (keyword log) into verb chains. Groups consecutive entries by shared nouns into experience chains.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "emotion": {
+                                "type": "string",
+                                "description": "Emotion for the chains",
+                                "default": "neutral",
+                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                            },
+                            "importance": {
+                                "type": "integer",
+                                "description": "Importance level (1-5)",
+                                "default": 3,
+                                "minimum": 1,
+                                "maximum": 5,
+                            },
+                            "clear_buffer": {
+                                "type": "boolean",
+                                "description": "Clear the buffer after crystallizing",
+                                "default": False,
+                            },
+                            "min_verbs": {
+                                "type": "integer",
+                                "description": "Minimum verb steps to keep a chain",
+                                "default": 2,
+                                "minimum": 1,
+                            },
+                            "batch_size": {
+                                "type": "integer",
+                                "description": "Max entries to process per call (0=all)",
+                                "default": 50,
+                                "minimum": 0,
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Start from this entry index in the buffer",
+                                "default": 0,
+                                "minimum": 0,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="remember_experience",
+                    description="Manually create a verb chain (experience). Use this to structure an experience as a sequence of verbs with associated nouns.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "steps": {
+                                "type": "array",
+                                "description": "Sequence of verb steps",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "verb": {
+                                            "type": "string",
+                                            "description": "The verb (e.g., '見る')",
+                                        },
+                                        "nouns": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Associated nouns (e.g., ['シオ', 'キーボード'])",
+                                            "default": [],
+                                        },
+                                    },
+                                    "required": ["verb"],
+                                },
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "Free-form context/description for this experience",
+                                "default": "",
+                            },
+                            "emotion": {
+                                "type": "string",
+                                "description": "Emotion",
+                                "default": "neutral",
+                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                            },
+                            "importance": {
+                                "type": "integer",
+                                "description": "Importance (1-5)",
+                                "default": 3,
+                                "minimum": 1,
+                                "maximum": 5,
+                            },
+                        },
+                        "required": ["steps"],
+                    },
+                ),
+                Tool(
+                    name="recall_experience",
+                    description="Recall verb chains (experiences) by semantic similarity. Uses time decay, emotion boost, and importance scoring.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "context": {
+                                "type": "string",
+                                "description": "What you want to remember about",
+                            },
+                            "n_results": {
+                                "type": "integer",
+                                "description": "Number of experiences to recall",
+                                "default": 5,
+                                "minimum": 1,
+                                "maximum": 20,
+                            },
+                        },
+                        "required": ["context"],
+                    },
+                ),
+                Tool(
+                    name="recall_by_verb",
+                    description="Recall experiences starting from a specific verb or noun. Expands associatively through shared verbs/nouns across chains.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "verb": {
+                                "type": "string",
+                                "description": "A verb to start from (e.g., '見る')",
+                            },
+                            "noun": {
+                                "type": "string",
+                                "description": "A noun to start from (e.g., 'シオ')",
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "How many expansion levels (1-5)",
+                                "default": 2,
+                                "minimum": 1,
+                                "maximum": 5,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                # Sensory Buffer / Dream
+                Tool(
+                    name="dream",
+                    description="Review the sensory buffer (rough keyword log from conversations). Use this to 'dream' - find patterns in accumulated keywords, then promote important ones to proper memories via remember.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "clear": {
+                                "type": "boolean",
+                                "description": "Clear the buffer after reading (default: false)",
+                                "default": False,
+                            },
+                        },
                     },
                 ),
             ]
@@ -622,6 +536,54 @@ class MemoryMCPServer:
                         if not content:
                             return [TextContent(type="text", text="Error: content is required")]
 
+                        image_path = arguments.get("image_path")
+                        camera_pos_data = arguments.get("camera_position")
+                        audio_path = arguments.get("audio_path")
+                        transcript = arguments.get("transcript")
+
+                        # Visual memory path
+                        if image_path and camera_pos_data:
+                            if self._sensory_integration is None:
+                                return [TextContent(type="text", text="Error: Sensory integration not initialized")]
+                            camera_position = CameraPosition(
+                                pan_angle=camera_pos_data["pan_angle"],
+                                tilt_angle=camera_pos_data["tilt_angle"],
+                                preset_id=camera_pos_data.get("preset_id"),
+                            )
+                            memory = await self._sensory_integration.save_visual_memory(
+                                content=content,
+                                image_path=image_path,
+                                camera_position=camera_position,
+                                emotion=arguments.get("emotion", "neutral"),
+                                importance=arguments.get("importance", 3),
+                                resolution=arguments.get("resolution"),
+                            )
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"Visual memory saved!\nID: {memory.id}\nContent: {memory.content}\nImage: {image_path}\nCamera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\nEmotion: {memory.emotion} | Importance: {memory.importance}",
+                                )
+                            ]
+
+                        # Audio memory path
+                        if audio_path and transcript:
+                            if self._sensory_integration is None:
+                                return [TextContent(type="text", text="Error: Sensory integration not initialized")]
+                            memory = await self._sensory_integration.save_audio_memory(
+                                content=content,
+                                audio_path=audio_path,
+                                transcript=transcript,
+                                emotion=arguments.get("emotion", "neutral"),
+                                importance=arguments.get("importance", 3),
+                            )
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=f"Audio memory saved!\nID: {memory.id}\nContent: {memory.content}\nAudio: {audio_path}\nTranscript: {transcript}\nEmotion: {memory.emotion} | Importance: {memory.importance}",
+                                )
+                            ]
+
+                        # Standard text memory path
                         auto_link = arguments.get("auto_link", True)
 
                         if auto_link:
@@ -689,9 +651,52 @@ class MemoryMCPServer:
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
 
+                        chain_depth = arguments.get("chain_depth", 0)
+                        n_results = arguments.get("n_results", 3)
+
+                        if chain_depth >= 1:
+                            # With associations (merged recall_with_associations)
+                            results = await self._memory_store.recall_with_chain(
+                                context=context,
+                                n_results=n_results,
+                                chain_depth=chain_depth,
+                            )
+
+                            if not results:
+                                return [TextContent(type="text", text="No relevant memories found.")]
+
+                            main_results = [r for r in results if r.distance < 900]
+                            linked_results = [r for r in results if r.distance >= 900]
+
+                            output_lines = [f"Recalled {len(main_results)} memories with {len(linked_results)} linked associations:\n"]
+
+                            output_lines.append("=== Primary Memories ===\n")
+                            for i, result in enumerate(main_results, 1):
+                                m = result.memory
+                                output_lines.append(
+                                    f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
+                                    f"ID: {m.id}\n"
+                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"{m.content}\n"
+                                )
+
+                            if linked_results:
+                                output_lines.append("\n=== Linked Memories ===\n")
+                                for i, result in enumerate(linked_results, 1):
+                                    m = result.memory
+                                    output_lines.append(
+                                        f"--- Linked {i} ---\n"
+                                        f"ID: {m.id}\n"
+                                        f"[{m.timestamp}] [{m.emotion}]\n"
+                                        f"{m.content}\n"
+                                    )
+
+                            return [TextContent(type="text", text="\n".join(output_lines))]
+
+                        # Standard recall (no associations)
                         results = await self._memory_store.recall(
                             context=context,
-                            n_results=arguments.get("n_results", 3),
+                            n_results=n_results,
                         )
 
                         if not results:
@@ -855,6 +860,14 @@ Date Range:
                             max_replay_events=arguments.get("max_replay_events", 200),
                             link_update_strength=arguments.get("link_update_strength", 0.2),
                         )
+
+                        # Graph consolidation (decay + prune)
+                        if self._memory_graph is not None:
+                            try:
+                                graph_stats = await self._memory_graph.consolidate()
+                                stats.update(graph_stats)
+                            except Exception as e:
+                                stats["graph_error"] = str(e)
 
                         return [
                             TextContent(
@@ -1232,7 +1245,7 @@ Date Range:
                         if not situation:
                             return [TextContent(type="text", text="Error: situation is required")]
 
-                        person = arguments.get("person", "コウタ")
+                        person = arguments.get("person", self._server_config.tom_default_person)
 
                         # Pull relevant memories: personality, communication patterns
                         memories = await self._memory_store.recall(
@@ -1253,12 +1266,36 @@ Date Range:
                                 + "\n".join(memory_lines)
                             )
 
+                        # Pull verb chain experiences
+                        experience_context = ""
+                        if self._verb_chain_store is not None:
+                            try:
+                                experiences = await self._verb_chain_store.search(
+                                    query=f"{person} {situation}",
+                                    n_results=3,
+                                )
+                                if experiences:
+                                    exp_lines = []
+                                    for chain, _score in experiences:
+                                        steps_str = " → ".join(
+                                            f"{s.verb}({', '.join(s.nouns)})" if s.nouns else s.verb
+                                            for s in chain.steps
+                                        )
+                                        exp_lines.append(f"- [{chain.emotion}] {steps_str}")
+                                    experience_context = (
+                                        f"\n## {person}との体験記憶\n"
+                                        + "\n".join(exp_lines)
+                                    )
+                            except Exception:
+                                pass
+
                         output = (
                             f"# ToM: {person}の視点に立つ\n"
                             f"\n"
                             f"## 状況\n"
                             f"{situation}\n"
                             f"{memory_context}\n"
+                            f"{experience_context}\n"
                             f"\n"
                             f"## トーン分析（まず言い方を読め）\n"
                             f"→ 語尾、記号（笑/w/!/?/...）、敬語⇔タメ口、自嘲、照れ、皮肉などから発話の意図を読み取れ\n"
@@ -1276,7 +1313,272 @@ Date Range:
                             f"→ 相手のトーンに合わせた返し方を選べ\n"
                         )
 
+                        private = arguments.get("private", False)
+                        if private:
+                            encrypted = _xor_encrypt(output)
+                            f = tempfile.NamedTemporaryFile(
+                                mode="w",
+                                suffix=".enc",
+                                delete=False,
+                                encoding="ascii",
+                            )
+                            f.write(encrypted)
+                            f.close()
+                            return [TextContent(type="text", text=f"(private) → {f.name}")]
+
                         return [TextContent(type="text", text=output)]
+
+                    # Verb Chain Tools
+                    case "crystallize":
+                        buf_path = os.path.join(os.path.expanduser("~"), ".claude", "sensory_buffer.jsonl")
+                        if not os.path.exists(buf_path):
+                            return [TextContent(type="text", text="バッファは空です。結晶化する材料がありません。")]
+
+                        all_entries: list[dict[str, Any]] = []
+                        with open(buf_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    all_entries.append(json.loads(line))
+                                except json.JSONDecodeError:
+                                    continue
+
+                        if not all_entries:
+                            return [TextContent(type="text", text="バッファは空です。")]
+
+                        total_entries = len(all_entries)
+                        offset = arguments.get("offset", 0)
+                        batch_size = arguments.get("batch_size", 50)
+
+                        # offset適用
+                        if offset >= total_entries:
+                            return [TextContent(type="text", text=f"オフセット({offset})がバッファサイズ({total_entries})を超えています。")]
+
+                        entries = all_entries[offset:]
+
+                        # batch_size適用（0=全件）
+                        remaining = 0
+                        if batch_size > 0 and len(entries) > batch_size:
+                            remaining = len(entries) - batch_size
+                            entries = entries[:batch_size]
+
+                        chains = crystallize_buffer(
+                            entries=entries,
+                            emotion=arguments.get("emotion", "neutral"),
+                            importance=arguments.get("importance", 3),
+                            min_verbs=arguments.get("min_verbs", 2),
+                        )
+
+                        if not chains:
+                            return [TextContent(type="text", text="動詞が足りないため、チェーンを生成できませんでした。")]
+
+                        verb_chain_store = self._verb_chain_store
+                        for chain in chains:
+                            await verb_chain_store.save(chain)
+
+                        # clear_buffer: バッチ処理中（remaining > 0）はクリアしない
+                        cleared = False
+                        if arguments.get("clear_buffer", False) and remaining == 0:
+                            os.remove(buf_path)
+                            cleared = True
+
+                        # サマリー出力（代表チェーン最大5つ + 統計）
+                        max_preview = 5
+                        output_lines = [
+                            f"## 結晶化完了: {len(chains)} チェーン保存",
+                            f"処理: {len(entries)}/{total_entries} エントリ (offset={offset})\n",
+                        ]
+                        for i, chain in enumerate(chains[:max_preview], 1):
+                            # 動詞の流れだけ簡潔に表示
+                            verb_flow = "→".join(s.verb for s in chain.steps)
+                            top_nouns = set()
+                            for s in chain.steps:
+                                top_nouns.update(s.nouns)
+                            nouns_str = ", ".join(list(top_nouns)[:8])
+                            output_lines.append(f"  {i}. {verb_flow}")
+                            if nouns_str:
+                                output_lines.append(f"     ({nouns_str})")
+
+                        if len(chains) > max_preview:
+                            output_lines.append(f"  ... 他 {len(chains) - max_preview} チェーン")
+
+                        if remaining > 0:
+                            next_offset = offset + batch_size
+                            output_lines.append(f"\n残り {remaining} エントリ → offset={next_offset} で続行")
+
+                        if cleared:
+                            output_lines.append("\n(バッファをクリアしました)")
+
+                        return [TextContent(type="text", text="\n".join(output_lines))]
+
+                    case "remember_experience":
+                        steps_raw = arguments.get("steps", [])
+                        if not steps_raw:
+                            return [TextContent(type="text", text="Error: steps is required")]
+
+                        steps = tuple(
+                            VerbStep(
+                                verb=s["verb"],
+                                nouns=tuple(s.get("nouns", [])),
+                            )
+                            for s in steps_raw
+                        )
+
+                        chain = VerbChain(
+                            id=str(uuid.uuid4()),
+                            steps=steps,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            emotion=arguments.get("emotion", "neutral"),
+                            importance=arguments.get("importance", 3),
+                            source="manual",
+                            context=arguments.get("context", ""),
+                        )
+
+                        verb_chain_store = self._verb_chain_store
+                        await verb_chain_store.save(chain)
+
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"Experience saved!\n"
+                                     f"ID: {chain.id}\n"
+                                     f"Chain: {chain.to_document()}\n"
+                                     f"Steps: {len(chain.steps)} | Emotion: {chain.emotion} | Importance: {chain.importance}",
+                            )
+                        ]
+
+                    case "recall_experience":
+                        context = arguments.get("context", "")
+                        if not context:
+                            return [TextContent(type="text", text="Error: context is required")]
+
+                        verb_chain_store = self._verb_chain_store
+                        results = await verb_chain_store.search(
+                            query=context,
+                            n_results=arguments.get("n_results", 5),
+                        )
+
+                        if not results:
+                            return [TextContent(type="text", text="No experiences found.")]
+
+                        # Bump graph edges for recalled chains
+                        for chain, _ in results:
+                            try:
+                                await verb_chain_store.bump_chain_edges(chain)
+                            except Exception:
+                                pass
+
+                        output_lines = [f"Recalled {len(results)} experiences:\n"]
+                        for i, (chain, score) in enumerate(results, 1):
+                            output_lines.append(
+                                f"--- Experience {i} (score: {score:.4f}) ---\n"
+                                f"ID: {chain.id}\n"
+                                f"[{chain.timestamp}] [{chain.emotion}] (importance: {chain.importance})\n"
+                                f"Chain: {chain.to_document()}\n"
+                            )
+
+                        return [TextContent(type="text", text="\n".join(output_lines))]
+
+                    case "recall_by_verb":
+                        verb = arguments.get("verb")
+                        noun = arguments.get("noun")
+
+                        if not verb and not noun:
+                            return [TextContent(type="text", text="Error: verb or noun is required")]
+
+                        verb_chain_store = self._verb_chain_store
+                        chains = await verb_chain_store.expand_from_fragment(
+                            verb=verb,
+                            noun=noun,
+                            depth=arguments.get("depth", 2),
+                            n_results=20,
+                        )
+
+                        # Bump graph edges for recalled chains
+                        for chain in chains:
+                            try:
+                                await verb_chain_store.bump_chain_edges(chain)
+                            except Exception:
+                                pass
+
+                        if not chains:
+                            query_desc = f"verb={verb}" if verb else ""
+                            if noun:
+                                query_desc += f"{' ' if query_desc else ''}noun={noun}"
+                            return [TextContent(type="text", text=f"No experiences found for {query_desc}.")]
+
+                        output_lines = [f"Found {len(chains)} related experiences:\n"]
+                        for i, chain in enumerate(chains, 1):
+                            output_lines.append(
+                                f"--- Experience {i} ---\n"
+                                f"ID: {chain.id}\n"
+                                f"[{chain.timestamp}] [{chain.emotion}] (importance: {chain.importance})\n"
+                                f"Chain: {chain.to_document()}\n"
+                            )
+
+                        return [TextContent(type="text", text="\n".join(output_lines))]
+
+                    # Sensory Buffer / Dream
+                    case "dream":
+                        buf_path = os.path.join(os.path.expanduser("~"), ".claude", "sensory_buffer.jsonl")
+                        if not os.path.exists(buf_path):
+                            return [TextContent(type="text", text="バッファは空です。まだ夢の材料がありません。")]
+
+                        words_count: dict[str, int] = {}
+                        verbs_count: dict[str, int] = {}
+                        verb_chains: list[list[str]] = []
+                        line_count = 0
+                        with open(buf_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    entry = json.loads(line)
+                                    for w in entry.get("w", []):
+                                        words_count[w] = words_count.get(w, 0) + 1
+                                    v_list = entry.get("v", [])
+                                    for v in v_list:
+                                        verbs_count[v] = verbs_count.get(v, 0) + 1
+                                    if v_list:
+                                        verb_chains.append(v_list)
+                                    line_count += 1
+                                except json.JSONDecodeError:
+                                    continue
+
+                        if not words_count and not verbs_count:
+                            return [TextContent(type="text", text="バッファは空です。")]
+
+                        output_lines = [f"## 夢の材料 ({line_count} interactions)\n"]
+
+                        if words_count:
+                            sorted_words = sorted(words_count.items(), key=lambda x: x[1], reverse=True)
+                            output_lines.append("### よく出てくるワード（名詞）")
+                            for word, count in sorted_words[:20]:
+                                output_lines.append(f"- {word}: {count}回")
+                            if len(sorted_words) > 20:
+                                output_lines.append(f"\n### その他 ({len(sorted_words) - 20}語)")
+                                others = [w for w, _ in sorted_words[20:]]
+                                output_lines.append(", ".join(others))
+
+                        if verbs_count:
+                            sorted_verbs = sorted(verbs_count.items(), key=lambda x: x[1], reverse=True)
+                            output_lines.append("\n### よく出てくる動詞")
+                            for verb, count in sorted_verbs[:15]:
+                                output_lines.append(f"- {verb}: {count}回")
+
+                        if verb_chains:
+                            output_lines.append("\n### 動詞チェーン（体験の流れ）")
+                            for chain in verb_chains[-10:]:
+                                output_lines.append(f"- {'→'.join(chain)}")
+
+                        if arguments.get("clear", False):
+                            os.remove(buf_path)
+                            output_lines.append("\n(バッファをクリアしました)")
+
+                        return [TextContent(type="text", text="\n".join(output_lines))]
 
                     case _:
                         return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1286,18 +1588,36 @@ Date Range:
                 return [TextContent(type="text", text=f"Error: {e!s}")]
 
     async def connect_memory(self) -> None:
-        """Connect to memory store (Phase 4: with episode manager & sensory integration)."""
+        """Connect to memory store (Phase 11: SQLite backend)."""
         config = MemoryConfig.from_env()
         self._memory_store = MemoryStore(config)
         await self._memory_store.connect()
         logger.info(f"Connected to memory store at {config.db_path}")
 
-        # Phase 4.2: Initialize episode manager
-        episodes_collection = self._memory_store.get_episodes_collection()
-        self._episode_manager = EpisodeManager(self._memory_store, episodes_collection)
+        # Preload embedding model to avoid cold-start delay on first recall
+        if not self._memory_store.embedding_fn.is_loaded:
+            logger.info("Preloading embedding model...")
+            await asyncio.to_thread(self._memory_store.embedding_fn._load_model)
+            logger.info("Embedding model preloaded")
+
+        # Episode manager (delegating to MemoryStore)
+        self._episode_manager = EpisodeManager(self._memory_store)
         logger.info("Episode manager initialized")
 
-        # Phase 4.3: Initialize sensory integration
+        # Memory graph (weighted verb/noun co-occurrence)
+        self._memory_graph = MemoryGraph(db=self._memory_store.db)
+        logger.info("Memory graph initialized")
+
+        # VerbChainStore (shares DB and embedding function with MemoryStore)
+        self._verb_chain_store = VerbChainStore(
+            db=self._memory_store.db,
+            embedding_fn=self._memory_store.embedding_fn,
+            graph=self._memory_graph,
+        )
+        await self._verb_chain_store.initialize()
+        logger.info("Verb chain store initialized")
+
+        # Sensory integration
         self._sensory_integration = SensoryIntegration(self._memory_store)
         logger.info("Sensory integration initialized")
 
@@ -1306,6 +1626,8 @@ Date Range:
         if self._memory_store:
             await self._memory_store.disconnect()
             self._memory_store = None
+            self._verb_chain_store = None
+            self._memory_graph = None
             logger.info("Disconnected from memory store")
 
     @asynccontextmanager

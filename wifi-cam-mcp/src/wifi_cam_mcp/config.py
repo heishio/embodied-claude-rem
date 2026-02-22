@@ -17,6 +17,7 @@ class CameraConfig:
     password: str
     onvif_port: int = 2020
     stream_url: str | None = None
+    listen_url: str | None = None  # RTSP URL for audio recording (e.g. go2rtc relay)
     max_width: int = 1920
     max_height: int = 1080
     mount_mode: str = "normal"  # "normal" (desktop) or "ceiling" (inverted)
@@ -36,6 +37,7 @@ class CameraConfig:
             os.getenv(f"{prefix}_ONVIF_PORT", "") or os.getenv("TAPO_ONVIF_PORT", "") or "2020"
         )
         stream_url = os.getenv(f"{prefix}_STREAM_URL") or os.getenv("TAPO_STREAM_URL")
+        listen_url = os.getenv(f"{prefix}_LISTEN_URL") or os.getenv("TAPO_LISTEN_URL")
         mount_mode = (
             os.getenv(f"{prefix}_MOUNT_MODE", "") or os.getenv("TAPO_MOUNT_MODE", "") or "normal"
         ).lower()
@@ -57,6 +59,7 @@ class CameraConfig:
             password=password,
             onvif_port=onvif_port,
             stream_url=stream_url,
+            listen_url=listen_url,
             mount_mode=mount_mode,
             max_width=max_width,
             max_height=max_height,
