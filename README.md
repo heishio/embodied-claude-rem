@@ -55,6 +55,132 @@
 - VOICEVOX（音声合成用、無料・ローカル、任意）
 - go2rtc（カメラスピーカー出力用、自動ダウンロード対応）
 
+## 環境別セットアップ（重要）
+
+tts-mcp で音声再生を行うには、環境に合わせた準備が必要です。
+
+### Windows
+
+#### 1. ffmpeg のインストール（必須）
+
+TTS のローカル再生に ffplay が必要です。**システム PATH に追加されている必要があります。**
+
+**winget を使う場合（推奨）:**
+```powershell
+winget install ffmpeg
+```
+
+**Chocolatey を使う場合:**
+```powershell
+choco install ffmpeg
+```
+
+**手動インストール:**
+1. [ffmpeg 公式サイト](https://ffmpeg.org/download.html) または [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) からダウンロード
+2. 任意のフォルダに展開（例: `C:\ffmpeg`）
+3. `C:\ffmpeg\bin` を環境変数 PATH に追加
+
+インストール後、**新しいターミナルを開いて**確認：
+```powershell
+where ffplay
+# C:\ffmpeg\bin\ffplay.exe 等が表示されればOK
+```
+
+#### 2. Python のインストール
+
+[Python 公式サイト](https://www.python.org/downloads/) から Python 3.10 以上をインストール。
+インストール時に **「Add Python to PATH」にチェック**を入れてください。
+
+#### 3. uv のインストール
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+#### 4. GPU（Whisper 音声認識用、オプション）
+
+wifi-cam-mcp の音声認識（Whisper）を使う場合、NVIDIA GPU があると高速化されます。
+[CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) をインストールしてください。
+
+### macOS
+
+#### 1. Homebrew のインストール
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+#### 2. ffmpeg のインストール
+
+```bash
+brew install ffmpeg
+```
+
+#### 3. uv のインストール
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+#### 4. Python のインストール（必要な場合）
+
+```bash
+brew install python@3.11
+```
+
+### Linux（Ubuntu/Debian）
+
+#### 1. 必要なパッケージのインストール
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip ffmpeg portaudio19-dev
+```
+
+#### 2. uv のインストール
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+#### 3. PulseAudio（音声再生用）
+
+```bash
+sudo apt install -y pulseaudio pulseaudio-utils
+```
+
+### WSL2
+
+WSL2 では追加の設定が必要です。
+
+#### 1. USB カメラの転送（usb-webcam-mcp 用）
+
+Windows 側で usbipd をインストール：
+```powershell
+winget install usbipd
+```
+
+カメラを WSL に転送：
+```powershell
+usbipd list
+usbipd bind --busid <BUSID>
+usbipd attach --wsl --busid <BUSID>
+```
+
+#### 2. 音声再生の設定（tts-mcp 用）
+
+WSLg の PulseAudio を使用：
+```bash
+# .env に以下を追加
+TTS_PLAYBACK=paplay
+PULSE_SERVER=unix:/mnt/wslg/PulseServer
+```
+
+#### 3. 制限事項
+
+- **system-temperature-mcp**: WSL2 では温度センサーにアクセスできないため動作しません
+- **USB カメラ**: 使用時は毎回 `usbipd attach` が必要です
+
 ## セットアップ
 
 ### 1. リポジトリのクローン
@@ -442,6 +568,71 @@ crontab -e
 - 定期的にカメラで撮影が行われます
 - 他人のプライバシーに配慮し、適切な場所で使用してください
 - 不要な場合は cron から削除してください
+
+## トラブルシューティング
+
+### tts-mcp で音声が再生されない
+
+#### Windows: `[WinError 2] 指定されたファイルが見つかりません`
+
+**原因**: ffplay が PATH に含まれていない
+
+**解決策**:
+1. ffmpeg をインストール（上記「環境別セットアップ」参照）
+2. **新しいターミナル**を開く（PATH の更新を反映するため）
+3. `where ffplay` で確認
+
+#### Windows: `go2rtc error: [WinError 10061]`
+
+**原因**: go2rtc が起動していない、またはカメラスピーカーを使わない設定
+
+**解決策**: カメラスピーカーを使わない場合は無視してOK。ローカル再生にフォールバックされます。
+
+#### WSL2: 音が出ない
+
+**原因**: PulseAudio が設定されていない
+
+**解決策**:
+```bash
+# .env に追加
+TTS_PLAYBACK=paplay
+PULSE_SERVER=unix:/mnt/wslg/PulseServer
+```
+
+#### macOS: `afplay failed`
+
+**原因**: 音声フォーマットの問題
+
+**解決策**: ffmpeg をインストールして mp3 → wav 変換を有効化
+```bash
+brew install ffmpeg
+```
+
+### wifi-cam-mcp でカメラに接続できない
+
+#### `ONVIF connection failed`
+
+**原因**: カメラのローカルアカウントが設定されていない
+
+**解決策**: Tapo アプリで「高度な設定」→「カメラのアカウント」をオンにしてローカルアカウントを作成（詳細は「Tapo カメラの設定」セクション参照）
+
+#### `RTSP stream failed`
+
+**原因**: ネットワークの問題、または「サードパーティ連携」がオフ
+
+**解決策**:
+1. カメラと同じネットワークにいることを確認
+2. Tapo アプリ →「私」→「音声アシスタント」→「サードパーティ連携」をオン
+
+### memory-mcp でエラー
+
+#### `numpy` や `sqlite3` 関連のエラー
+
+**解決策**: 依存関係を再インストール
+```bash
+cd memory-mcp
+uv sync --reinstall
+```
 
 ## 哲学的考察
 

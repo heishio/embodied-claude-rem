@@ -54,6 +54,132 @@ Traditional LLMs were passive — they could only see what was shown to them. Wi
 - VOICEVOX (text-to-speech, free & local, optional)
 - go2rtc (camera speaker output, auto-downloaded)
 
+## Environment-Specific Setup (Important)
+
+To use tts-mcp for audio playback, you need to set up your environment properly.
+
+### Windows
+
+#### 1. Install ffmpeg (Required)
+
+ffplay is required for local TTS playback. **It must be added to the system PATH.**
+
+**Using winget (Recommended):**
+```powershell
+winget install ffmpeg
+```
+
+**Using Chocolatey:**
+```powershell
+choco install ffmpeg
+```
+
+**Manual Installation:**
+1. Download from [ffmpeg official site](https://ffmpeg.org/download.html) or [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
+2. Extract to a folder (e.g., `C:\ffmpeg`)
+3. Add `C:\ffmpeg\bin` to your PATH environment variable
+
+After installation, **open a new terminal** and verify:
+```powershell
+where ffplay
+# Should show C:\ffmpeg\bin\ffplay.exe or similar
+```
+
+#### 2. Install Python
+
+Download Python 3.10+ from the [Python official site](https://www.python.org/downloads/).
+**Check "Add Python to PATH"** during installation.
+
+#### 3. Install uv
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+#### 4. GPU for Whisper Speech Recognition (Optional)
+
+If using wifi-cam-mcp speech recognition (Whisper), an NVIDIA GPU will speed things up significantly.
+Install [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit).
+
+### macOS
+
+#### 1. Install Homebrew
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+#### 2. Install ffmpeg
+
+```bash
+brew install ffmpeg
+```
+
+#### 3. Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+#### 4. Install Python (if needed)
+
+```bash
+brew install python@3.11
+```
+
+### Linux (Ubuntu/Debian)
+
+#### 1. Install Required Packages
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip ffmpeg portaudio19-dev
+```
+
+#### 2. Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+#### 3. PulseAudio (for audio playback)
+
+```bash
+sudo apt install -y pulseaudio pulseaudio-utils
+```
+
+### WSL2
+
+WSL2 requires additional configuration.
+
+#### 1. USB Camera Forwarding (for usb-webcam-mcp)
+
+Install usbipd on Windows:
+```powershell
+winget install usbipd
+```
+
+Forward camera to WSL:
+```powershell
+usbipd list
+usbipd bind --busid <BUSID>
+usbipd attach --wsl --busid <BUSID>
+```
+
+#### 2. Audio Playback Configuration (for tts-mcp)
+
+Use WSLg's PulseAudio:
+```bash
+# Add to .env
+TTS_PLAYBACK=paplay
+PULSE_SERVER=unix:/mnt/wslg/PulseServer
+```
+
+#### 3. Limitations
+
+- **system-temperature-mcp**: Does not work on WSL2 (no access to temperature sensors)
+- **USB Camera**: Requires `usbipd attach` each time you use it
+
 ## Setup
 
 ### 1. Clone the repository
@@ -389,6 +515,71 @@ crontab -e
 
 - **Arms**: Servo motors or laser pointers for "pointing" gestures
 - **Long-distance walks**: Going further in warmer seasons
+
+## Troubleshooting
+
+### tts-mcp: Audio not playing
+
+#### Windows: `[WinError 2] The system cannot find the file specified`
+
+**Cause**: ffplay is not in PATH
+
+**Solution**:
+1. Install ffmpeg (see "Environment-Specific Setup" above)
+2. **Open a new terminal** (to pick up PATH changes)
+3. Verify with `where ffplay`
+
+#### Windows: `go2rtc error: [WinError 10061]`
+
+**Cause**: go2rtc is not running, or camera speaker is not configured
+
+**Solution**: If you're not using camera speaker output, this can be ignored. Playback will fall back to local.
+
+#### WSL2: No sound
+
+**Cause**: PulseAudio not configured
+
+**Solution**:
+```bash
+# Add to .env
+TTS_PLAYBACK=paplay
+PULSE_SERVER=unix:/mnt/wslg/PulseServer
+```
+
+#### macOS: `afplay failed`
+
+**Cause**: Audio format issue
+
+**Solution**: Install ffmpeg to enable mp3 → wav conversion
+```bash
+brew install ffmpeg
+```
+
+### wifi-cam-mcp: Cannot connect to camera
+
+#### `ONVIF connection failed`
+
+**Cause**: Camera local account not set up
+
+**Solution**: In Tapo app, go to "Advanced Settings" → "Camera Account" and create a local account (see "Tapo Camera Configuration" section for details)
+
+#### `RTSP stream failed`
+
+**Cause**: Network issue, or "Third Party Compatibility" is off
+
+**Solution**:
+1. Make sure you're on the same network as the camera
+2. In Tapo app → "Me" → "Voice Assistant" → Turn on "Third Party Compatibility"
+
+### memory-mcp: Errors
+
+#### `numpy` or `sqlite3` related errors
+
+**Solution**: Reinstall dependencies
+```bash
+cd memory-mcp
+uv sync --reinstall
+```
 
 ## Philosophical Reflections
 
