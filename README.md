@@ -20,11 +20,11 @@
 
 ### TTS の Style-Bert-VITS2 対応
 
-ElevenLabs / VOICEVOX に加え、ローカルで動作する Style-Bert-VITS2 エンジンを追加。カメラスピーカーへのバックチャネル再生も改善。
+ローカルで動作する Style-Bert-VITS2 対応を追加。カメラスピーカーへのバックチャネル再生も改善。
 
 ### Windows 対応
 
-オリジナルは Mac/Linux 前提だが、このフォークは Windows（Git Bash）環境でも動作する。
+このフォークは Windows（Git Bash）環境でも動作する。
 
 ---
 
