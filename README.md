@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **Fork元**: [kmizu/embodied-claude](https://github.com/kmizu/embodied-claude)
-> このフォークは、[kmizu](https://github.com/kmizu) さんのオリジナルプロジェクトをベースにしています。「AIに身体を与える」という着想と、それを安価なハードウェアで実現するアーキテクチャは全てオリジナルに由来します。
+> このフォークは、[kmizu](https://github.com/kmizu) さんとここねさんの embodied-claude をベースにしています。「AIに身体を与える」という着想、それを安価なハードウェアで実現するアーキテクチャ、そしてAIと共に歩むという姿勢の全てがオリジナルに由来します。
 
 ## このフォークの独自拡張
 
