@@ -180,6 +180,18 @@ transversal 交差のメンバーは recall_divergent で intersection boost を
 ### Phase 5: Freshness減衰
 全記憶の freshness を ×0.92。
 
+## recall-lite（自動想起フック）
+
+会話のたびに裏で動く軽量検索フック。ユーザーの発話から名詞・動詞を抽出し、recall_index（事前計算テーブル）を使って関連する記憶を即座に検索する。結果は `[memory-hint]` としてコンテキストに注入される。
+
+```
+ユーザー発話 → sudachi形態素解析 → 名詞(最大2) + 動詞(最大1)
+  → recall_index検索（事前計算済み類似度テーブル）
+  → [memory-hint] noun=梅 (8件) として注入
+```
+
+keyword-buffer が「溜める」のに対して、recall-lite は「今すぐ調べてヒントを返す」。
+
 ## その他のコンポーネント
 
 | モジュール | 役割 |
