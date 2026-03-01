@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 # ── Bias Update Constants ──────────────────────
 BIAS_ACCUMULATION_RATE = 0.01    # バイアス蓄積レート（控えめ）
 BIAS_MAX_CAP = 0.15              # 単一バイアスの上限
-BIAS_DECAY_FACTOR = 0.90         # コンソリデーション毎の減衰率
+BIAS_DECAY_FACTOR = 0.95         # コンソリデーション毎の減衰率
 BIAS_PRUNE_THRESHOLD = 0.001    # この値以下のバイアスを刈り取り
 BIAS_APPLY_COEFFICIENT = 0.05   # recall時のノイズ適用係数
 
@@ -102,10 +102,14 @@ class ConsolidationEngine:
         similarity_threshold: float = 0.75,
         min_group_size: int = 2,
         max_group_size: int = 8,
+        source_level: int = 0,
+        target_level: int = 1,
     ) -> dict[str, int]:
-        """類似した level=0 記憶をグループ化し、合成記憶（level=1）を生成する。"""
+        """指定 source_level の記憶をグループ化し、target_level の合成記憶を生成する。"""
         # 1. 対象取得
-        mem_vecs = await store.fetch_level0_memories_with_vectors(min_freshness=0.1)
+        mem_vecs = await store.fetch_memories_with_vectors_by_level(
+            level=source_level, min_freshness=0.1,
+        )
         if len(mem_vecs) < min_group_size:
             return {"composites_created": 0, "composites_skipped": 0}
 
@@ -192,7 +196,12 @@ class ConsolidationEngine:
             category_counter = Counter(categories)
             composite_category = category_counter.most_common(1)[0][0]
 
-            # 7. 保存
+            # 7. PCA: 主成分軸の計算
+            pca_result = self._compute_principal_axis(member_vectors)
+            axis_vector = pca_result[0] if pca_result else None
+            explained_var = pca_result[1] if pca_result else None
+
+            # 8. 保存
             await store.save_composite(
                 member_ids=list(member_ids),
                 vector=composite_vector,
@@ -200,6 +209,9 @@ class ConsolidationEngine:
                 importance=composite_importance,
                 freshness=composite_freshness,
                 category=composite_category,
+                axis_vector=axis_vector,
+                explained_variance_ratio=explained_var,
+                level=target_level,
             )
             composites_created += 1
 
@@ -252,6 +264,9 @@ class ConsolidationEngine:
 
         await store.clear_boundary_layers()
 
+        # 全compositeの主成分軸を取得（異方的エッジ判定用）
+        all_axes = await store.fetch_all_composite_axes()
+
         composites_processed = 0
         total_layers = 0
         # 各compositeのlayer0分類を記録（バイアス更新用）
@@ -268,9 +283,10 @@ class ConsolidationEngine:
 
             member_ids = [m[0] for m in members]
             member_vecs = np.array([m[1] for m in members])
+            axis_vec = all_axes.get(cid)  # None if no axis computed
 
-            # ── Layer 0: ノイズなし ──
-            layer0 = self._classify_edge_core(member_vecs, centroid)
+            # ── Layer 0: ノイズなし（異方的判定） ──
+            layer0 = self._classify_edge_core(member_vecs, centroid, axis_vec)
             composite_layer0_map[cid] = layer0
             all_layers: list[tuple[str, int, int]] = []
             for i, mid in enumerate(member_ids):
@@ -287,7 +303,7 @@ class ConsolidationEngine:
                 norm = np.linalg.norm(noised_centroid) + 1e-10
                 noised_centroid = noised_centroid / norm
 
-                layer_classes = self._classify_edge_core(noised_vecs, noised_centroid)
+                layer_classes = self._classify_edge_core(noised_vecs, noised_centroid, axis_vec)
                 layer_classifications.append(layer_classes)
                 for i, mid in enumerate(member_ids):
                     all_layers.append((mid, layer_idx, layer_classes[i]))
@@ -310,14 +326,40 @@ class ConsolidationEngine:
         }
 
     def _classify_edge_core(
-        self, member_vecs: np.ndarray, centroid: np.ndarray
+        self,
+        member_vecs: np.ndarray,
+        centroid: np.ndarray,
+        axis_vector: np.ndarray | None = None,
     ) -> list[int]:
-        """メンバーを重心からの距離で edge(1) / core(0) に分類。"""
-        # コサイン距離: d = 1 - cos(v, centroid)
+        """メンバーを重心からの距離で edge(1) / core(0) に分類。
+
+        axis_vectorがある場合、異方的距離を使用:
+        - 軸方向の距離は重み小（伸びてる方向なので自然）
+        - 垂直方向の距離は重み大（はみ出してる＝本当のedge）
+        """
         c_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
         m_norms = member_vecs / (np.linalg.norm(member_vecs, axis=1, keepdims=True) + 1e-10)
-        similarities = m_norms @ c_norm
-        distances = 1.0 - similarities
+
+        if axis_vector is None:
+            # 等方的: コサイン距離
+            similarities = m_norms @ c_norm
+            distances = 1.0 - similarities
+        else:
+            # 異方的: 軸方向と垂直方向で重み分離
+            a_norm = axis_vector / (np.linalg.norm(axis_vector) + 1e-10)
+
+            # 各メンバーの重心からの差分ベクトル
+            diffs = m_norms - c_norm
+            # 軸方向成分
+            axial_proj = np.outer(diffs @ a_norm, a_norm)  # (n, d)
+            # 垂直成分
+            perp = diffs - axial_proj
+
+            # 軸方向の距離（重み小: 0.3）と垂直方向の距離（重み大: 1.0）
+            axial_dist = np.linalg.norm(axial_proj, axis=1)
+            perp_dist = np.linalg.norm(perp, axis=1)
+            distances = 0.3 * axial_dist + 1.0 * perp_dist
+
         d_mean = float(np.mean(distances))
         return [1 if float(d) > d_mean else 0 for d in distances]
 
@@ -442,6 +484,247 @@ class ConsolidationEngine:
 
         await store.save_template_biases(bias_updates)
         return len(bias_updates)
+
+    def _compute_principal_axis(
+        self, member_vecs: np.ndarray
+    ) -> tuple[np.ndarray, float] | None:
+        """メンバーベクトルの第一主成分と寄与率を返す。
+
+        Returns:
+            (axis_vector, explained_variance_ratio) or None if < 2 members.
+        """
+        if member_vecs.shape[0] < 2:
+            return None
+
+        # 中心化
+        centroid = member_vecs.mean(axis=0)
+        centered = member_vecs - centroid
+
+        # SVD（経済的: 主成分1つだけ必要）
+        try:
+            _, s, vt = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None
+
+        axis = vt[0]  # 第一主成分方向
+        # 正規化
+        norm = np.linalg.norm(axis)
+        if norm < 1e-10:
+            return None
+        axis = axis / norm
+
+        # 寄与率
+        total_var = float(np.sum(s ** 2))
+        if total_var < 1e-10:
+            return None
+        explained = float(s[0] ** 2) / total_var
+
+        return axis.astype(np.float32), explained
+
+    async def detect_overlap(
+        self,
+        store: "MemoryStore",
+        overlap_threshold: float = 0.5,
+    ) -> dict[str, int]:
+        """composite 間の重なりを検出し、二重所属メンバーを追加する。
+
+        1. 全 composite の重心ベクトルを取得
+        2. 重心間コサイン類似度を計算
+        3. 類似度 > overlap_threshold のペアについてメンバーの二重所属を検出・追加
+        """
+        composite_ids = await store.fetch_all_composite_ids()
+        if len(composite_ids) < 2:
+            return {"overlap_pairs": 0, "dual_members_added": 0}
+
+        # 各 composite の重心とメンバーを取得
+        centroids: dict[str, np.ndarray] = {}
+        member_vecs_map: dict[str, list[tuple[str, np.ndarray]]] = {}
+        existing_members: dict[str, set[str]] = {}
+
+        member_sets = await store.fetch_all_composite_member_sets()
+
+        for cid in composite_ids:
+            centroid = await store.fetch_composite_centroid(cid)
+            if centroid is None:
+                continue
+            centroids[cid] = centroid
+            existing_members[cid] = member_sets.get(cid, set())
+
+            members = await store.fetch_composite_with_vectors(cid)
+            member_vecs_map[cid] = [(m[0], m[1]) for m in members]
+
+        cids_with_centroid = list(centroids.keys())
+        overlap_pairs = 0
+        dual_members_added = 0
+
+        db = store._ensure_connected()
+
+        for i in range(len(cids_with_centroid)):
+            for j in range(i + 1, len(cids_with_centroid)):
+                cid_a = cids_with_centroid[i]
+                cid_b = cids_with_centroid[j]
+                centroid_a = centroids[cid_a]
+                centroid_b = centroids[cid_b]
+
+                sim = float(np.dot(centroid_a, centroid_b) / (
+                    np.linalg.norm(centroid_a) * np.linalg.norm(centroid_b) + 1e-10
+                ))
+                if sim <= overlap_threshold:
+                    continue
+
+                overlap_pairs += 1
+
+                # A のメンバーが B の重心に近いか確認
+                for mid, mvec in member_vecs_map.get(cid_a, []):
+                    if mid in existing_members.get(cid_b, set()):
+                        continue
+                    msim = float(np.dot(mvec, centroid_b) / (
+                        np.linalg.norm(mvec) * np.linalg.norm(centroid_b) + 1e-10
+                    ))
+                    if msim > overlap_threshold:
+                        db.execute(
+                            """INSERT OR IGNORE INTO composite_members
+                               (composite_id, member_id, contribution_weight)
+                               VALUES (?, ?, ?)""",
+                            (cid_b, mid, 0.5),
+                        )
+                        dual_members_added += 1
+
+                # B のメンバーが A の重心に近いか確認
+                for mid, mvec in member_vecs_map.get(cid_b, []):
+                    if mid in existing_members.get(cid_a, set()):
+                        continue
+                    msim = float(np.dot(mvec, centroid_a) / (
+                        np.linalg.norm(mvec) * np.linalg.norm(centroid_a) + 1e-10
+                    ))
+                    if msim > overlap_threshold:
+                        db.execute(
+                            """INSERT OR IGNORE INTO composite_members
+                               (composite_id, member_id, contribution_weight)
+                               VALUES (?, ?, ?)""",
+                            (cid_a, mid, 0.5),
+                        )
+                        dual_members_added += 1
+
+        if dual_members_added > 0:
+            db.commit()
+
+        return {"overlap_pairs": overlap_pairs, "dual_members_added": dual_members_added}
+
+    async def rescue_orphans(
+        self,
+        store: "MemoryStore",
+        rescue_threshold: float = 0.4,
+        level: int = 0,
+    ) -> dict[str, int]:
+        """指定 level でどの composite にも属さない孤立記憶を最寄り composite に吸収する。"""
+        orphans = await store.fetch_orphan_memories(level=level, min_freshness=0.1)
+        if not orphans:
+            return {"orphans_found": 0, "orphans_rescued": 0}
+
+        composite_ids = await store.fetch_all_composite_ids()
+        if not composite_ids:
+            return {"orphans_found": len(orphans), "orphans_rescued": 0}
+
+        # 各 composite の重心を取得
+        centroids: dict[str, np.ndarray] = {}
+        for cid in composite_ids:
+            centroid = await store.fetch_composite_centroid(cid)
+            if centroid is not None:
+                centroids[cid] = centroid
+
+        if not centroids:
+            return {"orphans_found": len(orphans), "orphans_rescued": 0}
+
+        db = store._ensure_connected()
+        orphans_rescued = 0
+
+        for mem, vec in orphans:
+            best_cid = None
+            best_sim = -1.0
+            for cid, centroid in centroids.items():
+                sim = float(np.dot(vec, centroid) / (
+                    np.linalg.norm(vec) * np.linalg.norm(centroid) + 1e-10
+                ))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_cid = cid
+
+            if best_cid is not None and best_sim >= rescue_threshold:
+                db.execute(
+                    """INSERT OR IGNORE INTO composite_members
+                       (composite_id, member_id, contribution_weight)
+                       VALUES (?, ?, ?)""",
+                    (best_cid, mem.id, 0.3),
+                )
+                orphans_rescued += 1
+
+        if orphans_rescued > 0:
+            db.commit()
+
+        return {"orphans_found": len(orphans), "orphans_rescued": orphans_rescued}
+
+    async def detect_intersections(
+        self,
+        store: "MemoryStore",
+        parallel_threshold: float = 0.8,
+        transversal_threshold: float = 0.3,
+    ) -> dict[str, int]:
+        """全compositeペアの主成分軸を比較し、交差を検出。
+
+        - |cos(angle)| >= parallel_threshold → parallel（同次元重なり）
+        - |cos(angle)| <= transversal_threshold かつ共有メンバーあり → transversal（横断的交差）
+
+        Returns:
+            {"parallel_found": int, "transversal_found": int, "intersection_nodes": int}
+        """
+        axes = await store.fetch_all_composite_axes()
+        if len(axes) < 2:
+            return {"parallel_found": 0, "transversal_found": 0, "intersection_nodes": 0}
+
+        member_sets = await store.fetch_all_composite_member_sets()
+
+        composite_ids = list(axes.keys())
+        intersections: list[tuple[str, str, str, float, list[str]]] = []
+        intersection_node_ids: set[str] = set()
+
+        for i in range(len(composite_ids)):
+            for j in range(i + 1, len(composite_ids)):
+                cid_a = composite_ids[i]
+                cid_b = composite_ids[j]
+
+                axis_a = axes[cid_a]
+                axis_b = axes[cid_b]
+
+                # 軸間のコサイン（絶対値: 方向は問わない）
+                cos_angle = float(np.abs(np.dot(axis_a, axis_b)))
+
+                # 共有メンバー
+                members_a = member_sets.get(cid_a, set())
+                members_b = member_sets.get(cid_b, set())
+                shared = members_a & members_b
+
+                if cos_angle >= parallel_threshold:
+                    intersections.append((
+                        cid_a, cid_b, "parallel", cos_angle, list(shared),
+                    ))
+                    intersection_node_ids.update(shared)
+                elif cos_angle <= transversal_threshold and shared:
+                    intersections.append((
+                        cid_a, cid_b, "transversal", cos_angle, list(shared),
+                    ))
+                    intersection_node_ids.update(shared)
+
+        await store.save_intersections(intersections)
+
+        parallel = sum(1 for x in intersections if x[2] == "parallel")
+        transversal = sum(1 for x in intersections if x[2] == "transversal")
+
+        return {
+            "parallel_found": parallel,
+            "transversal_found": transversal,
+            "intersection_nodes": len(intersection_node_ids),
+        }
 
     def _is_after(self, memory: "Memory", cutoff: datetime) -> bool:
         try:
