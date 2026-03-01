@@ -100,7 +100,7 @@ flowchart TD
 
 ### TTS の Style-Bert-VITS2 対応
 
-ElevenLabs / VOICEVOX に加え、ローカルで動作する Style-Bert-VITS2 エンジンを追加。カメラスピーカーへのバックチャネル再生も改善。
+ローカルで動作する Style-Bert-VITS2 対応を追加。
 
 ### Windows 対応
 
