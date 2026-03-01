@@ -17,8 +17,6 @@
 - **交差検出**: 異なる文脈の記憶クラスタが共有メンバーを持つ場合の横断的交差（transversal intersection）を検出
 - **クラスタ重なり**: composite 間の二重所属メンバーを検出・追加
 - **孤立救出**: どのクラスタにも属さない記憶を最寄り composite に吸収
-- **発散的想起（recall_divergent）**: ワークスペース理論に基づく競合的記憶選択
-- **Theory of Mind**: 自己内省ツール
 
 ### TTS の Style-Bert-VITS2 対応
 
