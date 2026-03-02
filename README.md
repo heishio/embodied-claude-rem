@@ -3,108 +3,29 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **Fork元**: [kmizu/embodied-claude](https://github.com/kmizu/embodied-claude)
-> このフォークは、[kmizu](https://github.com/kmizu) さんとここねさんの embodied-claude をベースにしています。「AIに身体を与える」という着想、それを安価なハードウェアで実現するアーキテクチャ、そしてAIと共に歩むという姿勢の全てがオリジナルに由来します。
+> このフォークは、[kmizu](https://github.com/kmizu) さんのオリジナルプロジェクトをベースにしています。「AIに身体を与える」という着想と、それを安価なハードウェアで実現するアーキテクチャは全てオリジナルに由来します。
 
 ## このフォークの独自拡張
 
 ### 記憶システム（memory-mcp）の大幅拡張
 
-オリジナルに、以下の仕組みを追加:
+以下の仕組みを追加:
 
-#### 全体像
+- **動詞チェーン記憶**: 体験を動詞の流れ（見る→驚く→話しかける）で記録・検索するエピソード記憶
+- **合成記憶（Composite Memory）**: 類似記憶を自動グループ化し、多段（L0→L1→L2）で抽象化
+- **バウンダリーシステム**: 主成分軸による異方的エッジ検出、ノイズレイヤー、テンプレートバイアス蓄積
+- **交差検出**: 異なる文脈の記憶クラスタが共有メンバーを持つ場合の横断的交差（transversal intersection）を検出
+- **クラスタ重なり**: composite 間の二重所属メンバーを検出・追加
+- **孤立救出**: どのクラスタにも属さない記憶を最寄り composite に吸収
 
-```mermaid
-flowchart TD
-    A["🗣️ 会話"] -->|自動| B["keyword-buffer\n(hook)"]
-    A -->|手動| C["diary(+steps)\nremember_experience"]
-
-    B -->|crystallize| D[("memory.db\n(SQLite)")]
-    C --> D
-
-    subgraph storage ["ストレージ"]
-        D
-        M["memories\n日記 + 感情 + freshness"]
-        V["verb_chains\n動詞→動詞→動詞\n+ 各stepに名詞"]
-        D --- M
-        D --- V
-    end
-
-    subgraph recall ["検索 (3種類)"]
-        R1["recall / search\nrecall_divergent\nベクトル類似度"]
-        R2["recall_experience\nベクトル類似度"]
-        R3["recall_by_verb\nグラフ展開\n芋づる式"]
-    end
-
-    M --> R1
-    M --> R2
-    V --> R2
-    V --> R3
-
-    subgraph consolidate ["consolidate (統合)"]
-        direction TB
-        C1["1. freshness 減衰"]
-        C2["2. リンク強化"]
-        C3["3. 合成記憶"]
-        C4["4. バウンダリー"]
-        C5["5. 交差検出"]
-        C1 --> C2 --> C3 --> C4 --> C5
-    end
-
-    R1 & R2 & R3 -.->|定期実行| consolidate
-
-    subgraph composite ["合成記憶 (多段)"]
-        L0["L0: 個別の記憶"]
-        L1["L1: 類似グループ"]
-        L2["L2: グループのグループ"]
-        L0 -->|"Union-Find\n(閾値 0.75)"| L1
-        L1 -->|"Union-Find\n(閾値 0.55)"| L2
-    end
-
-    C3 --> composite
-
-    subgraph boundary ["各レベルで実行"]
-        E1["edge/core 分類"]
-        E2["テンプレートノイズ"]
-        E3["バイアス蓄積"]
-        E4["横断的交差検出"]
-    end
-
-    C4 --> boundary
-    C5 --> boundary
-```
-
-#### 動詞チェーン（体験記憶）
-
-体験を「動詞の流れ」で記録する仕組み。会話中のキーワードが自動で蓄積され、動詞チェーンに変換される。
-
-```
-会話 → keyword-buffer(自動) → sensory_buffer → crystallize → 動詞チェーン
-                                                見る(空) → 気になる(色) → 調べる(天気)
-```
-
-ベクトル類似度による検索に加え、動詞・名詞のグラフを芋づる式に展開する検索ができる。「意味が似ている」だけでなく「実際に一緒に体験した」記憶を辿れる。
-
-#### 合成記憶（多段グループ化）
-
-類似した記憶を Union-Find で自動グループ化し、グループの代表ベクトルを生成する。閾値を変えた多段合成（L0→L1→L2）により、異なる粒度の抽象化を重ねる。孤立した記憶の救出や、クラスタ間の二重所属も検出する。
-
-#### バウンダリーシステム
-
-合成記憶の内部で、各メンバーが中心（core）か外縁（edge）かを分類する。動詞チェーンをテンプレートとしたノイズを加え、分類の揺れを観測する。揺れやすい方向（よくある体験パターン）にバイアスが蓄積され、次の統合でそのパターン方向への連想がさらに広がりやすくなる。
-
-#### 交差検出
-
-異なる文脈の記憶クラスタが、主成分軸の方向が直交しているにもかかわらず共有メンバーを持つ場合を「横断的交差」として検出する。「全然違う文脈なのに同じ記憶が浮かぶ」連想の飛躍を可能にする。
-
-詳細は [memory-mcp/README.md](./memory-mcp/README.md) を参照。
 
 ### TTS の Style-Bert-VITS2 対応
 
-ローカルで動作する Style-Bert-VITS2 対応を追加。
+ローカルで動作する Style-Bert-VITS2 対応追加。
 
 ### Windows 対応
 
-このフォークは Windows（Git Bash）環境でも動作する。
+- Windows（Git Bash）環境でも動作する。
 
 ---
 
