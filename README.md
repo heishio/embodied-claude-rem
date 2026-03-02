@@ -9,8 +9,6 @@
 
 ### 記憶システム（memory-mcp）の大幅拡張
 
-Multilingual E5 → chiVe へ移行
-
 オリジナルに、以下の仕組みを追加:
 
 #### 全体像
@@ -75,9 +73,14 @@ flowchart TD
     C5 --> boundary
 ```
 
-#### 動詞チェーン + 文脈交差
+#### 2ベクトルアーキテクチャ（chiVe word2vec）
 
-「文の動詞の流れ」と「対象との差分」の二軸で表現する
+全ての記憶を「何をしたか」(flow) と「何に対してか」(delta) の2軸で表現する。[chiVe](https://github.com/WorksApplications/chiVe)（日本語word2vec, 300次元）を使用。
+
+- **flow_vector**: 動詞バイグラム中点の平均（汎用動詞フィルタ + ブックエンド補正）
+- **delta_vector**: 名詞平均 − 動詞平均
+
+2軸が独立に動くことで、「同じことを違う対象にした」(Analogy) と「違うことを同じ対象にした」(Surface) を区別できる。
 
 #### 動詞チェーン（体験記憶）
 
@@ -88,7 +91,7 @@ flowchart TD
                                                 見る(空) → 気になる(色) → 調べる(天気)
 ```
 
-ベクトル類似度による検索に加え、動詞・名詞のグラフを芋づる式に展開する検索ができる。「意味が似ている」だけでなく「実際に一緒に体験した」記憶を辿れる。
+2ベクトルによるセマンティック検索に加え、動詞・名詞のグラフを芋づる式に展開する検索もできる。
 
 #### 合成記憶（多段グループ化）
 
@@ -133,7 +136,7 @@ flowchart TD
 | [usb-webcam-mcp](./usb-webcam-mcp/) | 目 | USB カメラから画像取得 | nuroum V11 等 |
 | [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
 | [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
-| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・合成記憶・バウンダリーシステム・ToM（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + SentenceTransformer |
+| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・合成記憶・バウンダリーシステム・ToM（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
 | [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
 
 ## アーキテクチャ
