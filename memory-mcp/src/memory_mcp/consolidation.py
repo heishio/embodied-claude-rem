@@ -397,6 +397,13 @@ class ConsolidationEngine:
                 max_template_strength,
             )
             alpha = rng.normal(0, 1)
+            # Pad template vector to match member dimension if needed
+            if len(t_vec) < dim:
+                t_padded = np.zeros(dim, dtype=t_vec.dtype)
+                t_padded[:len(t_vec)] = t_vec
+                t_vec = t_padded
+            elif len(t_vec) > dim:
+                t_vec = t_vec[:dim]
             t_norm = t_vec / (np.linalg.norm(t_vec) + 1e-10)
             alignments = m_norms @ t_norm  # shape: (n_members,)
             for i in range(n_members):

@@ -21,7 +21,7 @@ class TestSynthesizeComposites:
         engine = ConsolidationEngine()
         stats = await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.5,  # 低めに設定してテストを確実に
+            similarity_threshold=0.0,  # mock chiVe: hash-based random vecs need very low threshold
             min_group_size=2,
         )
 
@@ -53,7 +53,7 @@ class TestSynthesizeComposites:
         engine = ConsolidationEngine()
         await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.5,
+            similarity_threshold=0.0,  # mock chiVe
             min_group_size=2,
         )
 
@@ -75,7 +75,7 @@ class TestSynthesizeComposites:
         engine = ConsolidationEngine()
         stats = await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.3,  # 十分低く
+            similarity_threshold=0.0,  # mock chiVe
             min_group_size=2,
         )
 

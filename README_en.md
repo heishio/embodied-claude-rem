@@ -223,20 +223,19 @@ See `wifi-cam-mcp/README.md` for stereo vision / right eye tools.
 
 | Tool | Description |
 |------|-------------|
-| `remember` | Save a memory (with emotion, importance, category) |
+| `remember` | Save a memory (text/visual/audio unified. emotion, importance, category) |
 | `search_memories` | Semantic search (with filters) |
-| `recall` | Context-based recall |
+| `recall` | Context-based recall (chain_depth>=1 follows linked memories) |
 | `recall_divergent` | Divergent associative recall |
-| `recall_with_associations` | Recall with linked memories |
-| `save_visual_memory` | Save memory with image (base64, resolution: low/medium/high) |
-| `save_audio_memory` | Save memory with audio (Whisper transcript) |
-| `recall_by_camera_position` | Recall visual memories by camera direction |
-| `create_episode` / `search_episodes` | Create/search episodes (bundles of experiences) |
-| `link_memories` / `get_causal_chain` | Causal links between memories |
+| `link_memories` | Create links between memories |
 | `tom` | Theory of Mind (perspective-taking) |
-| `get_working_memory` / `refresh_working_memory` | Working memory (short-term buffer) |
 | `consolidate_memories` | Memory replay & consolidation (hippocampal replay-inspired) |
-| `list_recent_memories` / `get_memory_stats` | Recent memories & statistics |
+| `list_recent_memories` | Recent memories list |
+| `dream` | Review sensory buffer (keyword log) |
+| `crystallize` | Convert sensory buffer to verb chains (experience memory) |
+| `remember_experience` | Manually create a verb chain |
+| `recall_experience` | Semantic search for verb chains |
+| `recall_by_verb` | Expand related chains from a verb/noun |
 
 ### system-temperature-mcp
 

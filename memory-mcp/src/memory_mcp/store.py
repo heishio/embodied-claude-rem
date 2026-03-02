@@ -17,9 +17,9 @@ from .association import (
     adaptive_search_params,
 )
 from .bm25 import BM25Index
+from .chive import ChiVeEmbedding
 from .config import MemoryConfig
 from .consolidation import ConsolidationEngine
-from .embedding import E5EmbeddingFunction
 from .hopfield import HopfieldRecallResult, ModernHopfieldNetwork
 from .normalizer import get_reading, normalize_japanese
 from .predictive import (
@@ -89,7 +89,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 
 CREATE TABLE IF NOT EXISTS embeddings (
     memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    vector BLOB NOT NULL
+    vector BLOB NOT NULL,
+    flow_vector BLOB,
+    delta_vector BLOB
 );
 
 CREATE TABLE IF NOT EXISTS coactivation (
@@ -131,7 +133,8 @@ CREATE TABLE IF NOT EXISTS verb_chains (
 CREATE TABLE IF NOT EXISTS verb_chain_embeddings (
     chain_id TEXT PRIMARY KEY REFERENCES verb_chains(id) ON DELETE CASCADE,
     vector BLOB NOT NULL,
-    flow_vector BLOB
+    flow_vector BLOB,
+    delta_vector BLOB
 );
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -326,7 +329,7 @@ def _row_to_episode(row: sqlite3.Row) -> Episode:
 class MemoryStore:
     """SQLite + numpy memory storage (Phase 11)."""
 
-    def __init__(self, config: MemoryConfig):
+    def __init__(self, config: MemoryConfig, chive: ChiVeEmbedding | None = None):
         self._config = config
         self._db: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
@@ -334,7 +337,7 @@ class MemoryStore:
         self._association_engine = AssociationEngine()
         self._consolidation_engine = ConsolidationEngine()
         self._hopfield = ModernHopfieldNetwork(beta=4.0, n_iters=3)
-        self._embedding_fn = E5EmbeddingFunction(config.embedding_model)
+        self._chive = chive
         self._bm25_index = BM25Index()
 
     # ── Connection ──────────────────────────────
@@ -446,6 +449,15 @@ class MemoryStore:
                     vce_cols = [r[1] for r in conn.execute("PRAGMA table_info(verb_chain_embeddings)").fetchall()]
                     if "flow_vector" not in vce_cols:
                         conn.execute("ALTER TABLE verb_chain_embeddings ADD COLUMN flow_vector BLOB")
+                    # Migration: add delta_vector column to verb_chain_embeddings
+                    if "delta_vector" not in vce_cols:
+                        conn.execute("ALTER TABLE verb_chain_embeddings ADD COLUMN delta_vector BLOB")
+                    # Migration: add flow_vector/delta_vector columns to embeddings
+                    emb_cols = [r[1] for r in conn.execute("PRAGMA table_info(embeddings)").fetchall()]
+                    if "flow_vector" not in emb_cols:
+                        conn.execute("ALTER TABLE embeddings ADD COLUMN flow_vector BLOB")
+                    if "delta_vector" not in emb_cols:
+                        conn.execute("ALTER TABLE embeddings ADD COLUMN delta_vector BLOB")
                     conn.commit()
                     return conn
 
@@ -469,17 +481,21 @@ class MemoryStore:
         return self._ensure_connected()
 
     @property
-    def embedding_fn(self) -> E5EmbeddingFunction:
-        """Expose the embedding function (for VerbChainStore sharing)."""
-        return self._embedding_fn
+    def chive(self) -> ChiVeEmbedding:
+        """Expose the chiVe embedding (for VerbChainStore sharing)."""
+        assert self._chive is not None, "ChiVeEmbedding not initialized"
+        return self._chive
 
     # ── Embedding helpers ───────────────────────
 
-    async def _encode_document(self, text: str) -> list[float]:
-        return (await asyncio.to_thread(self._embedding_fn, [text]))[0]
+    def _encode_text_sync(self, text: str) -> tuple[np.ndarray, np.ndarray]:
+        """Encode text into (flow_vector, delta_vector) using chiVe. Sync version."""
+        assert self._chive is not None
+        return self._chive.encode_text(text)
 
-    async def _encode_query(self, text: str) -> list[float]:
-        return (await asyncio.to_thread(self._embedding_fn.encode_query, [text]))[0]
+    async def _encode_text(self, text: str) -> tuple[np.ndarray, np.ndarray]:
+        """Encode text into (flow_vector, delta_vector) using chiVe."""
+        return await asyncio.to_thread(self._encode_text_sync, text)
 
     # ── Coactivation helpers ────────────────────
 
@@ -547,8 +563,12 @@ class MemoryStore:
         normalized_content = normalize_japanese(content)
         reading = get_reading(content)
 
-        embedding = await self._encode_document(normalized_content)
-        vector_blob = encode_vector(embedding)
+        flow_vec, delta_vec = await self._encode_text(normalized_content)
+        # Legacy 'vector' column: concat of flow + delta for backward compat
+        concat_vec = np.concatenate([flow_vec, delta_vec])
+        vector_blob = encode_vector(concat_vec)
+        flow_blob = encode_vector(flow_vec)
+        delta_blob = encode_vector(delta_vec)
 
         def _insert() -> None:
             meta = memory.to_metadata()
@@ -588,8 +608,8 @@ class MemoryStore:
                 ),
             )
             db.execute(
-                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (memory_id, vector_blob),
+                "INSERT INTO embeddings (memory_id, vector, flow_vector, delta_vector) VALUES (?,?,?,?)",
+                (memory_id, vector_blob, flow_blob, delta_blob),
             )
             db.commit()
 
@@ -608,12 +628,16 @@ class MemoryStore:
         category_filter: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        flow_weight: float = 0.6,
     ) -> list[tuple[Memory, float]]:
-        """Return (memory, cosine_distance) pairs, sorted ascending by distance."""
+        """Return (memory, cosine_distance) pairs using 2-vector similarity.
+
+        Similarity = flow_weight * cos(flow) + (1-flow_weight) * cos(delta)
+        Distance = 1 - similarity
+        """
         db = self._ensure_connected()
         normalized_query = normalize_japanese(query)
-        query_emb = await self._encode_query(normalized_query)
-        query_vec = np.array(query_emb, dtype=np.float32)
+        q_flow, q_delta = await self._encode_text(normalized_query)
 
         # Build WHERE clause for filters
         conditions: list[str] = []
@@ -632,32 +656,54 @@ class MemoryStore:
             params.append(date_to)
 
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        sql = f"SELECT m.*, e.vector FROM memories m JOIN embeddings e ON m.id = e.memory_id {where_clause}"
+        sql = (
+            f"SELECT m.*, e.vector, e.flow_vector, e.delta_vector "
+            f"FROM memories m JOIN embeddings e ON m.id = e.memory_id {where_clause}"
+        )
 
-        def _query() -> list[tuple[sqlite3.Row, bytes]]:
+        def _query() -> list[tuple[sqlite3.Row, bytes | None, bytes | None]]:
             rows = db.execute(sql, params).fetchall()
-            return [(row, bytes(row["vector"])) for row in rows]
+            return [
+                (
+                    row,
+                    bytes(row["flow_vector"]) if row["flow_vector"] else None,
+                    bytes(row["delta_vector"]) if row["delta_vector"] else None,
+                )
+                for row in rows
+            ]
 
         rows_with_vecs = await asyncio.to_thread(_query)
         if not rows_with_vecs:
             return []
 
-        # Stack vectors for batch cosine similarity
-        vecs = np.stack([decode_vector(blob) for _, blob in rows_with_vecs])
-        scores = cosine_similarity(query_vec, vecs)  # higher = more similar
+        # Compute 2-axis similarity for each memory
+        scored: list[tuple[int, float]] = []
+        for i, (row, flow_blob, delta_blob) in enumerate(rows_with_vecs):
+            if flow_blob and delta_blob:
+                m_flow = decode_vector(flow_blob)
+                m_delta = decode_vector(delta_blob)
+                flow_sim = float(cosine_similarity(q_flow, m_flow.reshape(1, -1))[0])
+                delta_sim = float(cosine_similarity(q_delta, m_delta.reshape(1, -1))[0])
+                sim = flow_weight * flow_sim + (1.0 - flow_weight) * delta_sim
+            else:
+                # Legacy: fallback to concat vector (skip if dimension mismatch)
+                legacy_vec = decode_vector(bytes(row["vector"]))
+                q_concat = np.concatenate([q_flow, q_delta])
+                if legacy_vec.shape[0] != q_concat.shape[0]:
+                    continue
+                sim = float(cosine_similarity(q_concat, legacy_vec.reshape(1, -1))[0])
+            scored.append((i, sim))
 
-        # Convert similarity to distance (like ChromaDB cosine distance)
-        # cosine distance = 1 - similarity
-        indexed = list(enumerate(rows_with_vecs))
-        ranked = sorted(indexed, key=lambda t: scores[t[0]], reverse=True)
-        ranked = ranked[:n_results]
+        scored.sort(key=lambda t: t[1], reverse=True)
+        scored = scored[:n_results]
 
         results: list[tuple[Memory, float]] = []
-        for idx, (row, _) in ranked:
+        for idx, sim in scored:
+            row = rows_with_vecs[idx][0]
             memory_id = row["id"]
             coactivation = await asyncio.to_thread(self._get_coactivation, db, memory_id)
             memory = _row_to_memory(row, coactivation)
-            distance = float(1.0 - scores[idx])
+            distance = float(1.0 - sim)
             results.append((memory, distance))
 
         return results
@@ -957,8 +1003,11 @@ class MemoryStore:
         # Normalize and embed the full new content
         normalized = normalize_japanese(new_content)
         reading = get_reading(new_content)
-        embedding = await self._encode_document(normalized)
-        vector_blob = encode_vector(embedding)
+        flow_vec, delta_vec = await self._encode_text(normalized)
+        concat_vec = np.concatenate([flow_vec, delta_vec])
+        vector_blob = encode_vector(concat_vec)
+        flow_blob = encode_vector(flow_vec)
+        delta_blob = encode_vector(delta_vec)
 
         # Determine updated emotion/importance
         new_emotion = emotion if emotion is not None else existing.emotion
@@ -976,8 +1025,8 @@ class MemoryStore:
                 (new_content, normalized, reading, new_emotion, new_importance, memory_id),
             )
             db.execute(
-                "UPDATE embeddings SET vector = ? WHERE memory_id = ?",
-                (vector_blob, memory_id),
+                "UPDATE embeddings SET vector = ?, flow_vector = ?, delta_vector = ? WHERE memory_id = ?",
+                (vector_blob, flow_blob, delta_blob, memory_id),
             )
             db.commit()
 
@@ -1237,68 +1286,74 @@ class MemoryStore:
         vocab_list = sorted(vocab)
         logger.info("rebuild_recall_index_full: %d vocabulary words collected", len(vocab_list))
 
-        # 2. Encode all vocabulary words as queries
-        word_vectors = await asyncio.to_thread(
-            self._embedding_fn.encode_query, vocab_list
-        )
-        word_vecs_np = np.array(word_vectors, dtype=np.float32)
+        # 2. Encode all vocabulary words via chiVe
+        assert self._chive is not None
+        word_vecs_map = await asyncio.to_thread(self._chive.batch_get, vocab_list)
+        # Filter out OOV words
+        valid_words = [w for w in vocab_list if w in word_vecs_map]
+        if not valid_words:
+            logger.warning("rebuild_recall_index_full: all vocabulary OOV in chiVe, skipping")
+            return 0
+        word_vecs_np = np.array([word_vecs_map[w] for w in valid_words], dtype=np.float32)
 
-        # 3. Load all memory embeddings
-        def _load_memory_embeddings() -> tuple[list[str], list[str], np.ndarray | None]:
+        # 3. Load all memory flow_vectors
+        def _load_memory_flow() -> tuple[list[str], list[str], np.ndarray | None]:
             rows = db.execute(
-                "SELECT e.memory_id, m.content, e.vector "
-                "FROM embeddings e JOIN memories m ON e.memory_id = m.id"
+                "SELECT e.memory_id, m.content, e.flow_vector "
+                "FROM embeddings e JOIN memories m ON e.memory_id = m.id "
+                "WHERE e.flow_vector IS NOT NULL"
             ).fetchall()
             if not rows:
                 return [], [], None
             ids = [r[0] for r in rows]
             previews = [r[1][:20] if r[1] else "" for r in rows]
             vecs = np.array(
-                [decode_vector(r[2]) for r in rows], dtype=np.float32
+                [decode_vector(bytes(r[2])) for r in rows], dtype=np.float32
             )
             return ids, previews, vecs
 
-        mem_ids, mem_previews, mem_vecs = await asyncio.to_thread(_load_memory_embeddings)
+        mem_ids, mem_previews, mem_flow_vecs = await asyncio.to_thread(_load_memory_flow)
 
-        # 4. Load all verb_chain embeddings
-        def _load_chain_embeddings() -> tuple[list[str], list[str], np.ndarray | None]:
+        # 4. Load all verb_chain flow_vectors
+        def _load_chain_flow() -> tuple[list[str], list[str], np.ndarray | None]:
             rows = db.execute(
-                "SELECT ce.chain_id, vc.context, ce.vector "
+                "SELECT ce.chain_id, vc.context, ce.flow_vector "
                 "FROM verb_chain_embeddings ce "
-                "JOIN verb_chains vc ON ce.chain_id = vc.id"
+                "JOIN verb_chains vc ON ce.chain_id = vc.id "
+                "WHERE ce.flow_vector IS NOT NULL"
             ).fetchall()
             if not rows:
                 return [], [], None
             ids = [r[0] for r in rows]
             previews = [r[1][:20] if r[1] else "" for r in rows]
             vecs = np.array(
-                [decode_vector(r[2]) for r in rows], dtype=np.float32
+                [decode_vector(bytes(r[2])) for r in rows], dtype=np.float32
             )
             return ids, previews, vecs
 
-        chain_ids, chain_previews, chain_vecs = await asyncio.to_thread(
-            _load_chain_embeddings
+        chain_ids, chain_previews, chain_flow_vecs = await asyncio.to_thread(
+            _load_chain_flow
         )
 
-        if mem_vecs is None and chain_vecs is None:
-            logger.warning("rebuild_recall_index_full: no embeddings found, skipping")
+        if mem_flow_vecs is None and chain_flow_vecs is None:
+            logger.warning("rebuild_recall_index_full: no flow vectors found, skipping")
             return 0
 
-        # 5. Compute similarities and build index entries
+        # 5. Compute similarities (word chiVe vec vs flow_vector)
         TOP_K = 20
         entries: list[tuple[str, str, str, float, str]] = []
 
-        for i, word in enumerate(vocab_list):
+        for i, word in enumerate(valid_words):
             word_vec = word_vecs_np[i]
             candidates: list[tuple[str, str, float, str]] = []
 
-            if mem_vecs is not None:
-                sims = cosine_similarity(word_vec, mem_vecs)
+            if mem_flow_vecs is not None:
+                sims = cosine_similarity(word_vec, mem_flow_vecs)
                 for j in range(len(mem_ids)):
                     candidates.append((mem_ids[j], "memory", float(sims[j]), mem_previews[j]))
 
-            if chain_vecs is not None:
-                sims = cosine_similarity(word_vec, chain_vecs)
+            if chain_flow_vecs is not None:
+                sims = cosine_similarity(word_vec, chain_flow_vecs)
                 for j in range(len(chain_ids)):
                     candidates.append((chain_ids[j], "chain", float(sims[j]), chain_previews[j]))
 
@@ -1330,23 +1385,21 @@ class MemoryStore:
     async def update_recall_index(self, memory_id: str, target_type: str = "memory") -> int:
         """Incrementally update recall_index for a single new memory/chain.
 
-        Computes similarity of the new embedding against all vocabulary words,
-        and inserts into recall_index if it ranks in the top-20 for that word.
-
+        Uses chiVe flow_vector for similarity against vocabulary words.
         Returns the number of entries added/updated.
         """
         db = self._ensure_connected()
 
-        # Load the new embedding
-        def _load_embedding() -> bytes | None:
+        # Load the new flow_vector
+        def _load_flow() -> bytes | None:
             table = "embeddings" if target_type == "memory" else "verb_chain_embeddings"
             id_col = "memory_id" if target_type == "memory" else "chain_id"
             row = db.execute(
-                f"SELECT vector FROM {table} WHERE {id_col} = ?", (memory_id,)
+                f"SELECT flow_vector FROM {table} WHERE {id_col} = ?", (memory_id,)
             ).fetchone()
-            return row[0] if row else None
+            return bytes(row[0]) if row and row[0] else None
 
-        blob = await asyncio.to_thread(_load_embedding)
+        blob = await asyncio.to_thread(_load_flow)
         if blob is None:
             return 0
 
@@ -1376,24 +1429,24 @@ class MemoryStore:
         if not vocab_list:
             return 0
 
-        # Encode vocabulary words as queries
-        word_vectors = await asyncio.to_thread(
-            self._embedding_fn.encode_query, vocab_list
-        )
-        word_vecs_np = np.array(word_vectors, dtype=np.float32)
+        # Encode vocabulary words via chiVe
+        assert self._chive is not None
+        word_vecs_map = await asyncio.to_thread(self._chive.batch_get, vocab_list)
+        valid_words = [w for w in vocab_list if w in word_vecs_map]
+        if not valid_words:
+            return 0
+        word_vecs_np = np.array([word_vecs_map[w] for w in valid_words], dtype=np.float32)
 
-        # Compute similarity of new memory against each word
-        sims = cosine_similarity(new_vec, word_vecs_np)  # (V,)
+        # Compute similarity of new flow_vector against each word
+        sims = cosine_similarity(new_vec, word_vecs_np)
 
         TOP_K = 20
-        updated = 0
 
         def _update_entries() -> int:
             count = 0
-            for i, word in enumerate(vocab_list):
+            for i, word in enumerate(valid_words):
                 sim = float(sims[i])
 
-                # Check if this beats the lowest score in top-20 for this word
                 rows = db.execute(
                     "SELECT similarity FROM recall_index "
                     "WHERE word = ? ORDER BY similarity ASC LIMIT 1",
@@ -1405,7 +1458,6 @@ class MemoryStore:
                 ).fetchone()[0]
 
                 if existing_count < TOP_K:
-                    # Room to add
                     db.execute(
                         "INSERT OR REPLACE INTO recall_index "
                         "(word, target_id, target_type, similarity, content_preview) "
@@ -1414,8 +1466,6 @@ class MemoryStore:
                     )
                     count += 1
                 elif rows and sim > rows[0][0]:
-                    # Replace the lowest-scoring entry
-                    # First delete the lowest
                     db.execute(
                         "DELETE FROM recall_index WHERE word = ? AND similarity = ("
                         "SELECT MIN(similarity) FROM recall_index WHERE word = ?)",
@@ -1466,8 +1516,11 @@ class MemoryStore:
 
         normalized_content = normalize_japanese(content)
         reading = get_reading(content)
-        embedding = await self._encode_document(normalized_content)
-        vector_blob = encode_vector(embedding)
+        flow_vec, delta_vec = await self._encode_text(normalized_content)
+        concat_vec = np.concatenate([flow_vec, delta_vec])
+        vector_blob = encode_vector(concat_vec)
+        flow_blob = encode_vector(flow_vec)
+        delta_blob = encode_vector(delta_vec)
 
         def _insert() -> None:
             meta = memory.to_metadata()
@@ -1504,8 +1557,8 @@ class MemoryStore:
                 ),
             )
             db.execute(
-                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (memory_id, vector_blob),
+                "INSERT INTO embeddings (memory_id, vector, flow_vector, delta_vector) VALUES (?,?,?,?)",
+                (memory_id, vector_blob, flow_blob, delta_blob),
             )
             db.commit()
 
@@ -1811,8 +1864,8 @@ class MemoryStore:
         ]
         if composite_ids:
             normalized_query = normalize_japanese(context)
-            query_emb = await self._encode_query(normalized_query)
-            query_vec = np.array(query_emb, dtype=np.float32)
+            q_flow, q_delta = await self._encode_text(normalized_query)
+            query_vec = np.concatenate([q_flow, q_delta])
             edge_memories = await self.expand_composite_edges(composite_ids, query_vec)
             for mem in edge_memories:
                 if mem.id not in all_candidates:
@@ -1978,23 +2031,31 @@ class MemoryStore:
         level: int = 0,
         min_freshness: float = 0.1,
     ) -> list[tuple[Memory, np.ndarray]]:
-        """指定 level かつ freshness > min_freshness の記憶とベクトルを取得。"""
+        """指定 level かつ freshness > min_freshness の記憶とベクトル(flow+delta concat)を取得。"""
         db = self._ensure_connected()
 
-        def _fetch() -> list[tuple[sqlite3.Row, bytes]]:
+        def _fetch() -> list[tuple[sqlite3.Row, bytes | None, bytes | None, bytes]]:
             rows = db.execute(
-                """SELECT m.*, e.vector FROM memories m
+                """SELECT m.*, e.vector, e.flow_vector, e.delta_vector FROM memories m
                    JOIN embeddings e ON e.memory_id = m.id
                    WHERE m.level = ? AND m.freshness > ?""",
                 (level, min_freshness),
             ).fetchall()
-            return [(row, bytes(row["vector"])) for row in rows]
+            return [
+                (row, row["flow_vector"], row["delta_vector"], bytes(row["vector"]))
+                for row in rows
+            ]
 
         raw = await asyncio.to_thread(_fetch)
         results: list[tuple[Memory, np.ndarray]] = []
-        for row, vec_blob in raw:
+        for row, flow_blob, delta_blob, legacy_blob in raw:
             mem = _row_to_memory(row)
-            vec = decode_vector(vec_blob)
+            if flow_blob and delta_blob:
+                flow = decode_vector(bytes(flow_blob))
+                delta = decode_vector(bytes(delta_blob))
+                vec = np.concatenate([flow, delta])
+            else:
+                vec = decode_vector(legacy_blob)
             results.append((mem, vec))
         return results
 
@@ -2030,22 +2091,33 @@ class MemoryStore:
         """指定 level でどの composite にも属さない孤立記憶を取得。"""
         db = self._ensure_connected()
 
-        def _fetch() -> list[tuple[sqlite3.Row, bytes]]:
+        def _fetch() -> list[tuple[sqlite3.Row, bytes | None, bytes | None, bytes]]:
             rows = db.execute(
-                """SELECT m.*, e.vector FROM memories m
+                """SELECT m.*, e.vector, e.flow_vector, e.delta_vector FROM memories m
                    JOIN embeddings e ON e.memory_id = m.id
                    LEFT JOIN composite_members cm ON cm.member_id = m.id
                    WHERE m.level = ? AND m.freshness > ?
                      AND cm.composite_id IS NULL""",
                 (level, min_freshness),
             ).fetchall()
-            return [(row, bytes(row["vector"])) for row in rows]
+            return [
+                (row, row["flow_vector"], row["delta_vector"], bytes(row["vector"]))
+                for row in rows
+            ]
 
         raw = await asyncio.to_thread(_fetch)
         results: list[tuple[Memory, np.ndarray]] = []
-        for row, vec_blob in raw:
+        for row, flow_blob, delta_blob, legacy_blob in raw:
             mem = _row_to_memory(row)
-            vec = decode_vector(vec_blob)
+            if flow_blob and delta_blob:
+                flow = decode_vector(bytes(flow_blob))
+                delta = decode_vector(bytes(delta_blob))
+                vec = np.concatenate([flow, delta])
+            else:
+                legacy_vec = decode_vector(legacy_blob)
+                if legacy_vec.shape[0] != self._chive.vector_size * 2:
+                    continue  # skip unmigrated 768-dim vectors
+                vec = legacy_vec
             results.append((mem, vec))
         return results
 
@@ -2061,12 +2133,25 @@ class MemoryStore:
         explained_variance_ratio: float | None = None,
         level: int = 1,
     ) -> str:
-        """合成記憶を保存し、composite_members に関係を登録。axis_vectorがあれば主成分軸も保存。"""
+        """合成記憶を保存し、composite_members に関係を登録。
+
+        vector is the full concat (flow+delta) centroid.
+        We split it into flow_vector and delta_vector for the embeddings table.
+        """
         db = self._ensure_connected()
         composite_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
         vector_blob = encode_vector(vector.tolist())
         axis_blob = encode_vector(axis_vector.tolist()) if axis_vector is not None else None
+
+        # Split the vector into flow and delta halves if it has the right dimension
+        chive_dim = self._chive.vector_size if self._chive else 300
+        if len(vector) == chive_dim * 2:
+            flow_blob = encode_vector(vector[:chive_dim].tolist())
+            delta_blob = encode_vector(vector[chive_dim:].tolist())
+        else:
+            flow_blob = None
+            delta_blob = None
 
         def _insert() -> None:
             db.execute(
@@ -2088,8 +2173,8 @@ class MemoryStore:
                 ),
             )
             db.execute(
-                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
-                (composite_id, vector_blob),
+                "INSERT INTO embeddings (memory_id, vector, flow_vector, delta_vector) VALUES (?,?,?,?)",
+                (composite_id, vector_blob, flow_blob, delta_blob),
             )
             for mid in member_ids:
                 db.execute(
@@ -2143,35 +2228,66 @@ class MemoryStore:
     async def fetch_composite_with_vectors(
         self, composite_id: str
     ) -> list[tuple[str, np.ndarray]]:
-        """compositeのメンバーIDとベクトルを取得。"""
+        """compositeのメンバーIDとベクトル(flow+delta concat)を取得。"""
         db = self._ensure_connected()
 
-        def _fetch() -> list[tuple[str, bytes]]:
+        def _fetch() -> list[tuple[str, bytes | None, bytes | None, bytes]]:
             rows = db.execute(
-                """SELECT cm.member_id, e.vector
+                """SELECT cm.member_id, e.flow_vector, e.delta_vector, e.vector
                    FROM composite_members cm
                    JOIN embeddings e ON e.memory_id = cm.member_id
                    WHERE cm.composite_id = ?""",
                 (composite_id,),
             ).fetchall()
-            return [(row["member_id"], bytes(row["vector"])) for row in rows]
+            return [
+                (row["member_id"], row["flow_vector"], row["delta_vector"], bytes(row["vector"]))
+                for row in rows
+            ]
 
         raw = await asyncio.to_thread(_fetch)
-        return [(mid, decode_vector(blob)) for mid, blob in raw]
+        results: list[tuple[str, np.ndarray]] = []
+        expected_dim = self._chive.vector_size * 2
+        for mid, flow_blob, delta_blob, legacy_blob in raw:
+            if flow_blob and delta_blob:
+                flow = decode_vector(bytes(flow_blob))
+                delta = decode_vector(bytes(delta_blob))
+                vec = np.concatenate([flow, delta])
+            else:
+                legacy_vec = decode_vector(legacy_blob)
+                if legacy_vec.shape[0] != expected_dim:
+                    continue
+                vec = legacy_vec
+            results.append((mid, vec))
+        return results
 
     async def fetch_composite_centroid(self, composite_id: str) -> np.ndarray | None:
-        """compositeの重心ベクトル（= embeddings に保存済みのベクトル）を取得。"""
+        """compositeの重心ベクトル(flow+delta concat)を取得。"""
         db = self._ensure_connected()
 
-        def _fetch() -> bytes | None:
+        def _fetch() -> tuple[bytes | None, bytes | None, bytes | None]:
             row = db.execute(
-                "SELECT vector FROM embeddings WHERE memory_id = ?",
+                "SELECT flow_vector, delta_vector, vector FROM embeddings WHERE memory_id = ?",
                 (composite_id,),
             ).fetchone()
-            return bytes(row["vector"]) if row else None
+            if not row:
+                return None, None, None
+            return (
+                bytes(row["flow_vector"]) if row["flow_vector"] else None,
+                bytes(row["delta_vector"]) if row["delta_vector"] else None,
+                bytes(row["vector"]) if row["vector"] else None,
+            )
 
-        blob = await asyncio.to_thread(_fetch)
-        return decode_vector(blob) if blob else None
+        flow_blob, delta_blob, legacy_blob = await asyncio.to_thread(_fetch)
+        if flow_blob and delta_blob:
+            flow = decode_vector(flow_blob)
+            delta = decode_vector(delta_blob)
+            return np.concatenate([flow, delta])
+        if legacy_blob:
+            legacy_vec = decode_vector(legacy_blob)
+            if legacy_vec.shape[0] != self._chive.vector_size * 2:
+                return None  # skip unmigrated 768-dim vector
+            return legacy_vec
+        return None
 
     async def fetch_all_composite_ids(self, level: int | None = None) -> list[str]:
         """composite IDを取得。level=None で全 composite、level=N で指定レベルのみ。"""
@@ -2313,13 +2429,12 @@ class MemoryStore:
     ) -> int:
         """経路ベクトルに最も aligned な boundary layer を選択。
 
-        各レイヤーの edge メンバーの平均ベクトルと path_vec の cos sim を計算。
+        各レイヤーの edge メンバーの flow_vector 平均と path_vec の cos sim を計算。
         最も高い layer_index を返す。edge データがなければ 0 を返す。
         """
         db = self._ensure_connected()
 
         def _select() -> int:
-            # 全レイヤーのインデックスを取得
             layer_rows = db.execute(
                 "SELECT DISTINCT layer_index FROM boundary_layers ORDER BY layer_index"
             ).fetchall()
@@ -2332,18 +2447,18 @@ class MemoryStore:
             best_sim = -2.0
 
             for lidx in layer_indices:
-                # このレイヤーの edge メンバーのベクトルを取得
                 edge_rows = db.execute(
-                    """SELECT e.vector
+                    """SELECT e.flow_vector
                        FROM boundary_layers bl
                        JOIN embeddings e ON e.memory_id = bl.member_id
-                       WHERE bl.layer_index = ? AND bl.is_edge = 1""",
+                       WHERE bl.layer_index = ? AND bl.is_edge = 1
+                         AND e.flow_vector IS NOT NULL""",
                     (lidx,),
                 ).fetchall()
                 if not edge_rows:
                     continue
 
-                edge_vecs = [decode_vector(bytes(r["vector"])) for r in edge_rows]
+                edge_vecs = [decode_vector(bytes(r["flow_vector"])) for r in edge_rows]
                 edge_mean = np.mean(edge_vecs, axis=0).reshape(1, -1)
                 sim = float(cosine_similarity(path_vec, edge_mean)[0])
 
@@ -2360,7 +2475,7 @@ class MemoryStore:
         chain_ids: list[str],
         layer_index: int | None = None,
     ) -> dict[str, float]:
-        """verb chain の boundary 近接スコアを計算。
+        """verb chain の boundary 近接スコアを計算 (flow_vector ベース)。
 
         layer_index 指定時: そのレイヤーの edge メンバーとの類似度ベース
         layer_index=None: fuzziness（全レイヤー横断）ベース
@@ -2373,36 +2488,34 @@ class MemoryStore:
         db = self._ensure_connected()
 
         def _calc() -> dict[str, float]:
-            # chain embeddings を取得
             placeholders = ",".join("?" for _ in chain_ids)
             chain_rows = db.execute(
-                f"""SELECT chain_id, vector FROM verb_chain_embeddings
-                    WHERE chain_id IN ({placeholders})""",
+                f"""SELECT chain_id, flow_vector FROM verb_chain_embeddings
+                    WHERE chain_id IN ({placeholders}) AND flow_vector IS NOT NULL""",
                 chain_ids,
             ).fetchall()
             if not chain_rows:
                 return {}
 
             chain_vecs = {
-                r["chain_id"]: decode_vector(bytes(r["vector"]))
+                r["chain_id"]: decode_vector(bytes(r["flow_vector"]))
                 for r in chain_rows
             }
 
             if layer_index is not None:
-                # 指定レイヤーの edge メンバーのベクトルを取得
                 edge_rows = db.execute(
-                    """SELECT e.vector
+                    """SELECT e.flow_vector
                        FROM boundary_layers bl
                        JOIN embeddings e ON e.memory_id = bl.member_id
-                       WHERE bl.layer_index = ? AND bl.is_edge = 1""",
+                       WHERE bl.layer_index = ? AND bl.is_edge = 1
+                         AND e.flow_vector IS NOT NULL""",
                     (layer_index,),
                 ).fetchall()
             else:
-                # fuzziness ベース: fuzziness > 0.5 のメンバーを edge とみなす
                 edge_rows = db.execute(
-                    """SELECT e.vector
+                    """SELECT e.flow_vector
                        FROM embeddings e
-                       WHERE e.memory_id IN (
+                       WHERE e.flow_vector IS NOT NULL AND e.memory_id IN (
                            SELECT bl.member_id
                            FROM boundary_layers bl
                            GROUP BY bl.member_id
@@ -2413,9 +2526,8 @@ class MemoryStore:
             if not edge_rows:
                 return {cid: 0.0 for cid in chain_vecs}
 
-            edge_vecs = np.stack([decode_vector(bytes(r["vector"])) for r in edge_rows])
+            edge_vecs = np.stack([decode_vector(bytes(r["flow_vector"])) for r in edge_rows])
 
-            # 各 chain embedding と edge embeddings の max cosine similarity
             result: dict[str, float] = {}
             for cid, cvec in chain_vecs.items():
                 sims = cosine_similarity(cvec, edge_vecs)
@@ -2431,44 +2543,42 @@ class MemoryStore:
         query_vec: np.ndarray,
         n_results: int = 3,
     ) -> list[tuple[str, float]]:
-        """composite の edge メンバーの平均ベクトルから隣接 composite を発見。
+        """composite の edge メンバーの flow_vector 平均から隣接 composite を発見。
 
         Returns: [(adjacent_composite_id, similarity), ...] 自身を除外。
         """
         db = self._ensure_connected()
 
         def _find() -> list[tuple[str, float]]:
-            # 1. edge メンバー（layer_index=0, is_edge=1）のベクトルを取得
             edge_rows = db.execute(
-                """SELECT e.vector
+                """SELECT e.flow_vector
                    FROM boundary_layers bl
                    JOIN embeddings e ON e.memory_id = bl.member_id
-                   WHERE bl.composite_id = ? AND bl.layer_index = 0 AND bl.is_edge = 1""",
+                   WHERE bl.composite_id = ? AND bl.layer_index = 0 AND bl.is_edge = 1
+                     AND e.flow_vector IS NOT NULL""",
                 (composite_id,),
             ).fetchall()
             if not edge_rows:
                 return []
 
-            # edge ベクトルの平均
-            edge_vecs = [decode_vector(bytes(r["vector"])) for r in edge_rows]
+            edge_vecs = [decode_vector(bytes(r["flow_vector"])) for r in edge_rows]
             edge_mean = np.mean(edge_vecs, axis=0)
 
-            # 2. 他の全 composite（level>=1）のベクトルを取得
             other_rows = db.execute(
-                """SELECT e.memory_id, e.vector
+                """SELECT e.memory_id, e.flow_vector
                    FROM embeddings e
                    JOIN memories m ON m.id = e.memory_id
-                   WHERE m.level >= 1 AND e.memory_id != ?""",
+                   WHERE m.level >= 1 AND e.memory_id != ?
+                     AND e.flow_vector IS NOT NULL""",
                 (composite_id,),
             ).fetchall()
             if not other_rows:
                 return []
 
-            # 3. cosine similarity でランク
             candidates: list[tuple[str, float]] = []
             for row in other_rows:
-                other_vec = decode_vector(bytes(row["vector"]))
-                sim = float(cosine_similarity(edge_mean, other_vec))
+                other_vec = decode_vector(bytes(row["flow_vector"]))
+                sim = float(cosine_similarity(edge_mean, other_vec.reshape(1, -1))[0])
                 candidates.append((row["memory_id"], sim))
 
             candidates.sort(key=lambda x: x[1], reverse=True)
@@ -2545,24 +2655,36 @@ class MemoryStore:
     async def fetch_verb_chain_templates(
         self,
     ) -> list[tuple[str, np.ndarray, list[str], list[str]]]:
-        """全VerbChainの(chain_id, vector, verbs_list, nouns_list)を取得。"""
+        """全VerbChainの(chain_id, flow_vector, verbs_list, nouns_list)を取得。"""
         db = self._ensure_connected()
 
-        def _fetch() -> list[tuple[str, bytes, str, str]]:
+        def _fetch() -> list[tuple[str, bytes | None, bytes, str, str]]:
             rows = db.execute(
-                """SELECT vc.id, vce.vector, vc.all_verbs, vc.all_nouns
+                """SELECT vc.id, vce.flow_vector, vce.vector, vc.all_verbs, vc.all_nouns
                    FROM verb_chains vc
                    JOIN verb_chain_embeddings vce ON vce.chain_id = vc.id"""
             ).fetchall()
             return [
-                (row["id"], bytes(row["vector"]), row["all_verbs"], row["all_nouns"])
+                (
+                    row["id"],
+                    bytes(row["flow_vector"]) if row["flow_vector"] else None,
+                    bytes(row["vector"]),
+                    row["all_verbs"],
+                    row["all_nouns"],
+                )
                 for row in rows
             ]
 
         raw = await asyncio.to_thread(_fetch)
         results: list[tuple[str, np.ndarray, list[str], list[str]]] = []
-        for chain_id, blob, verbs_str, nouns_str in raw:
-            vec = decode_vector(blob)
+        for chain_id, flow_blob, legacy_blob, verbs_str, nouns_str in raw:
+            if flow_blob:
+                vec = decode_vector(flow_blob)
+            else:
+                legacy_vec = decode_vector(legacy_blob)
+                if legacy_vec.shape[0] != self._chive.vector_size:
+                    continue  # skip unmigrated 768-dim vectors
+                vec = legacy_vec
             verbs = [v.strip() for v in verbs_str.split(",") if v.strip()]
             nouns = [n.strip() for n in nouns_str.split(",") if n.strip()]
             results.append((chain_id, vec, verbs, nouns))
@@ -2626,12 +2748,16 @@ class MemoryStore:
     # ── Hopfield ─────────────────────────────────
 
     async def hopfield_load(self) -> int:
-        """Load all embeddings from SQLite into Hopfield network."""
+        """Load all embeddings from SQLite into Hopfield network.
+
+        Uses flow+delta concat (600-dim) for pattern storage.
+        Falls back to legacy vector column if flow/delta not yet migrated.
+        """
         db = self._ensure_connected()
 
-        def _fetch() -> list[tuple[str, bytes, str]]:
+        def _fetch() -> list[tuple[str, bytes | None, bytes | None, bytes, str]]:
             sql = (
-                "SELECT e.memory_id, e.vector, m.normalized_content"
+                "SELECT e.memory_id, e.flow_vector, e.delta_vector, e.vector, m.normalized_content"
                 " FROM embeddings e JOIN memories m ON m.id = e.memory_id"
             )
             return db.execute(sql).fetchall()
@@ -2641,9 +2767,30 @@ class MemoryStore:
             self._hopfield.store([], [], [])
             return 0
 
-        ids = [r[0] for r in rows]
-        embeddings = [decode_vector(bytes(r[1])).tolist() for r in rows]
-        contents = [r[2] for r in rows]
+        ids: list[str] = []
+        embeddings: list[list[float]] = []
+        contents: list[str] = []
+        for r in rows:
+            mem_id = r[0]
+            flow_blob = r[1]
+            delta_blob = r[2]
+            legacy_blob = r[3]
+            content = r[4]
+
+            if flow_blob and delta_blob:
+                flow = decode_vector(bytes(flow_blob))
+                delta = decode_vector(bytes(delta_blob))
+                vec = np.concatenate([flow, delta])
+            else:
+                legacy_vec = decode_vector(bytes(legacy_blob))
+                if legacy_vec.shape[0] != self._chive.vector_size * 2:
+                    continue  # skip unmigrated 768-dim vectors
+                vec = legacy_vec
+
+            ids.append(mem_id)
+            embeddings.append(vec.tolist())
+            contents.append(content)
+
         self._hopfield.store(embeddings, ids, contents)
         return self._hopfield.n_memories
 
@@ -2665,7 +2812,8 @@ class MemoryStore:
 
         try:
             normalized_query = normalize_japanese(query)
-            query_emb = await self._encode_query(normalized_query)
+            q_flow, q_delta = await self._encode_text(normalized_query)
+            query_emb = np.concatenate([q_flow, q_delta]).tolist()
             _, similarities = self._hopfield.retrieve(query_emb)
             results = self._hopfield.recall_results(similarities, k=n_results)
         finally:
@@ -2705,3 +2853,237 @@ class MemoryStore:
             "avg_prediction_error": predictive.avg_prediction_error,
             "avg_novelty": predictive.avg_novelty,
         }
+
+    # ── chiVe 2-vector migration ─────────────────
+
+    async def migrate_to_chive_2vec(self) -> dict[str, int]:
+        """Migrate all existing memories and verb_chains to chiVe 2-vector.
+
+        - Re-encodes all memories via encode_text (sudachipy extraction → chiVe)
+        - Re-encodes all verb_chains via encode_chain (all_verbs/all_nouns → chiVe)
+        - Stores flow_vector + delta_vector + concat in each row
+        - Marks completion in meta.embedding_schema = 'v2_chive'
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        db = self._ensure_connected()
+        assert self._chive is not None
+
+        # Check if already migrated
+        TARGET_SCHEMA = "v2_chive_full"
+
+        def _check() -> str | None:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key = 'embedding_schema'"
+            ).fetchone()
+            return row[0] if row else None
+
+        current_schema = await asyncio.to_thread(_check)
+        if current_schema == TARGET_SCHEMA:
+            logger.info("migrate_to_chive_2vec: already at %s, skipping", TARGET_SCHEMA)
+            return {"memories_migrated": 0, "chains_migrated": 0}
+
+        # If already at v2_chive (partial), skip memory/chain re-encoding
+        skip_base_migration = current_schema == "v2_chive"
+
+        # 1. Migrate memories (batch of 100) — skip if already done
+        mem_count = 0
+        chain_count = 0
+
+        if skip_base_migration:
+            logger.info("migrate_to_chive_2vec: base migration done, skipping to composites")
+        else:
+            mem_count, chain_count = await self._migrate_base_memories_and_chains(db, logger)
+
+        # 2b-2c: composites + orphan cleanup (always run if not at full)
+        comp_count, orphan_count = await self._migrate_composites_and_cleanup(db, logger)
+
+        # 3. Mark completion
+        def _mark_done() -> None:
+            db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_schema', ?)",
+                (TARGET_SCHEMA,),
+            )
+            # Invalidate recall_index so it gets rebuilt
+            db.execute("DELETE FROM meta WHERE key = 'recall_index_built_at'")
+            # Reset flow_vector_version so verb_chain backfill recalculates
+            db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('flow_vector_version', '4')"
+            )
+            db.commit()
+
+        await asyncio.to_thread(_mark_done)
+
+        logger.info(
+            "migrate_to_chive_2vec: done. memories=%d, chains=%d, composites=%d, orphans_cleaned=%d",
+            mem_count, chain_count, comp_count, orphan_count,
+        )
+        return {"memories_migrated": mem_count, "chains_migrated": chain_count}
+
+    async def _migrate_base_memories_and_chains(
+        self, db: sqlite3.Connection, logger: Any,
+    ) -> tuple[int, int]:
+        """Re-encode all memories and verb_chains with chiVe 2-vector."""
+        def _get_memory_ids() -> list[str]:
+            rows = db.execute("SELECT id FROM memories").fetchall()
+            return [r[0] for r in rows]
+
+        mem_ids = await asyncio.to_thread(_get_memory_ids)
+
+        def _get_memory_content(mid: str) -> str:
+            row = db.execute(
+                "SELECT normalized_content FROM memories WHERE id = ?", (mid,)
+            ).fetchone()
+            return row[0] if row and row[0] else ""
+
+        mem_count = 0
+        for batch_start in range(0, len(mem_ids), 100):
+            batch = mem_ids[batch_start:batch_start + 100]
+            updates: list[tuple[bytes, bytes, bytes, str]] = []
+            for mid in batch:
+                content = await asyncio.to_thread(_get_memory_content, mid)
+                if not content:
+                    continue
+                flow_vec, delta_vec = self._encode_text_sync(content)
+                concat = np.concatenate([flow_vec, delta_vec])
+                updates.append((
+                    encode_vector(concat),
+                    encode_vector(flow_vec),
+                    encode_vector(delta_vec),
+                    mid,
+                ))
+
+            def _batch_update(upd: list[tuple[bytes, bytes, bytes, str]] = updates) -> int:
+                for vec_blob, flow_blob, delta_blob, mid in upd:
+                    db.execute(
+                        "UPDATE embeddings SET vector = ?, flow_vector = ?, delta_vector = ? WHERE memory_id = ?",
+                        (vec_blob, flow_blob, delta_blob, mid),
+                    )
+                db.commit()
+                return len(upd)
+
+            count = await asyncio.to_thread(_batch_update)
+            mem_count += count
+            logger.info("migrate_to_chive_2vec: memories %d/%d", mem_count, len(mem_ids))
+
+        # Migrate verb_chains (batch of 100)
+        def _get_chain_data() -> list[tuple[str, str, str]]:
+            rows = db.execute(
+                "SELECT id, all_verbs, all_nouns FROM verb_chains"
+            ).fetchall()
+            return [(r[0], r[1] or "", r[2] or "") for r in rows]
+
+        chain_data = await asyncio.to_thread(_get_chain_data)
+
+        chain_count = 0
+        for batch_start in range(0, len(chain_data), 100):
+            batch = chain_data[batch_start:batch_start + 100]
+            updates: list[tuple[bytes, bytes, bytes, str]] = []
+            for chain_id, verbs_str, nouns_str in batch:
+                verbs = [v.strip() for v in verbs_str.split(",") if v.strip()]
+                nouns = [n.strip() for n in nouns_str.split(",") if n.strip()]
+                if not verbs:
+                    continue
+                flow_vec, delta_vec = self._chive.encode_chain(verbs, nouns)
+                concat = np.concatenate([flow_vec, delta_vec])
+                updates.append((
+                    encode_vector(concat),
+                    encode_vector(flow_vec),
+                    encode_vector(delta_vec),
+                    chain_id,
+                ))
+
+            def _batch_update_chains(upd: list[tuple[bytes, bytes, bytes, str]] = updates) -> int:
+                for vec_blob, flow_blob, delta_blob, cid in upd:
+                    db.execute(
+                        "UPDATE verb_chain_embeddings SET vector = ?, flow_vector = ?, delta_vector = ? WHERE chain_id = ?",
+                        (vec_blob, flow_blob, delta_blob, cid),
+                    )
+                db.commit()
+                return len(upd)
+
+            count = await asyncio.to_thread(_batch_update_chains)
+            chain_count += count
+            logger.info("migrate_to_chive_2vec: chains %d/%d", chain_count, len(chain_data))
+
+        return mem_count, chain_count
+
+    async def _migrate_composites_and_cleanup(
+        self, db: sqlite3.Connection, logger: Any,
+    ) -> tuple[int, int]:
+        """Migrate composite vectors from member centroids + cleanup orphans."""
+        # Composite memories: re-compute from member centroids
+        def _get_composites() -> list[tuple[str, list[str]]]:
+            cids = db.execute(
+                "SELECT DISTINCT composite_id FROM composite_members"
+            ).fetchall()
+            result = []
+            for row in cids:
+                cid = row[0]
+                members = db.execute(
+                    "SELECT member_id FROM composite_members WHERE composite_id = ?",
+                    (cid,),
+                ).fetchall()
+                result.append((cid, [m[0] for m in members]))
+            return result
+
+        composites = await asyncio.to_thread(_get_composites)
+        comp_count = 0
+        for cid, member_ids in composites:
+            def _get_member_vecs(mids: list[str] = member_ids) -> list[tuple[bytes, bytes]]:
+                vecs = []
+                for mid in mids:
+                    row = db.execute(
+                        "SELECT flow_vector, delta_vector FROM embeddings WHERE memory_id = ?",
+                        (mid,),
+                    ).fetchone()
+                    if row and row[0] and row[1]:
+                        vecs.append((bytes(row[0]), bytes(row[1])))
+                return vecs
+
+            member_vecs = await asyncio.to_thread(_get_member_vecs)
+            if not member_vecs:
+                continue
+
+            flows = np.array([decode_vector(v[0]) for v in member_vecs], dtype=np.float32)
+            deltas = np.array([decode_vector(v[1]) for v in member_vecs], dtype=np.float32)
+            centroid_flow = flows.mean(axis=0)
+            centroid_delta = deltas.mean(axis=0)
+            norm_f = np.linalg.norm(centroid_flow)
+            norm_d = np.linalg.norm(centroid_delta)
+            if norm_f > 0:
+                centroid_flow /= norm_f
+            if norm_d > 0:
+                centroid_delta /= norm_d
+            concat = np.concatenate([centroid_flow, centroid_delta])
+
+            def _update_composite(
+                vec_blob: bytes = encode_vector(concat),
+                flow_blob: bytes = encode_vector(centroid_flow),
+                delta_blob: bytes = encode_vector(centroid_delta),
+                composite_id: str = cid,
+            ) -> None:
+                db.execute(
+                    "UPDATE embeddings SET vector = ?, flow_vector = ?, delta_vector = ? WHERE memory_id = ?",
+                    (vec_blob, flow_blob, delta_blob, composite_id),
+                )
+                db.commit()
+
+            await asyncio.to_thread(_update_composite)
+            comp_count += 1
+
+        logger.info("migrate_to_chive_2vec: composites %d/%d", comp_count, len(composites))
+
+        # Clean up orphaned verb_chain_embeddings
+        def _cleanup_orphans() -> int:
+            cur = db.execute(
+                "DELETE FROM verb_chain_embeddings WHERE chain_id NOT IN (SELECT id FROM verb_chains)"
+            )
+            db.commit()
+            return cur.rowcount
+
+        orphan_count = await asyncio.to_thread(_cleanup_orphans)
+        logger.info("migrate_to_chive_2vec: cleaned %d orphaned verb_chain_embeddings", orphan_count)
+
+        return comp_count, orphan_count

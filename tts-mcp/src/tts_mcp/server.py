@@ -142,6 +142,10 @@ class TTSMCP:
                                 "type": "string",
                                 "description": "SBV2 model name (optional)",
                             },
+                            "sbv2_model_id": {
+                                "type": "integer",
+                                "description": "SBV2 model ID override (optional)",
+                            },
                             "sbv2_style": {
                                 "type": "string",
                                 "description": "SBV2 voice style name (optional)",
@@ -153,6 +157,27 @@ class TTSMCP:
                             "sbv2_length": {
                                 "type": "number",
                                 "description": "SBV2 speech rate, 1.0=normal (optional)",
+                            },
+                            "sbv2_sdp_ratio": {
+                                "type": "number",
+                                "description": (
+                                    "SBV2 SDP/DP ratio (0.0-1.0). "
+                                    "0=flat intonation, 1=varied tempo (optional)"
+                                ),
+                            },
+                            "sbv2_noise": {
+                                "type": "number",
+                                "description": (
+                                    "SBV2 sample noise (0.0-1.0). "
+                                    "Higher=more random variation (optional)"
+                                ),
+                            },
+                            "sbv2_noisew": {
+                                "type": "number",
+                                "description": (
+                                    "SBV2 SDP noise (0.0-1.0). "
+                                    "Higher=more variation in speech timing (optional)"
+                                ),
                             },
                             "play_audio": {
                                 "type": "boolean",
@@ -208,6 +233,8 @@ class TTSMCP:
                     if arguments.get("pitch_scale") is not None:
                         kwargs["pitch_scale"] = arguments["pitch_scale"]
                 elif engine_name == "sbv2":
+                    if arguments.get("sbv2_model_id") is not None:
+                        kwargs["model_id"] = arguments["sbv2_model_id"]
                     if arguments.get("sbv2_model_name") is not None:
                         kwargs["model_name"] = arguments["sbv2_model_name"]
                     if arguments.get("sbv2_style") is not None:
@@ -216,6 +243,12 @@ class TTSMCP:
                         kwargs["style_weight"] = arguments["sbv2_style_weight"]
                     if arguments.get("sbv2_length") is not None:
                         kwargs["length"] = arguments["sbv2_length"]
+                    if arguments.get("sbv2_sdp_ratio") is not None:
+                        kwargs["sdp_ratio"] = arguments["sbv2_sdp_ratio"]
+                    if arguments.get("sbv2_noise") is not None:
+                        kwargs["noise"] = arguments["sbv2_noise"]
+                    if arguments.get("sbv2_noisew") is not None:
+                        kwargs["noisew"] = arguments["sbv2_noisew"]
 
                 # Try streaming for ElevenLabs
                 playback_mode = (pb.playback or "auto").strip().lower()

@@ -138,11 +138,14 @@ class TestCrystallizeBuffer:
 
 @pytest_asyncio.fixture
 async def memory_store(tmp_path):
+    from tests.conftest import MockChiVeEmbedding
+    mock_chive = MockChiVeEmbedding()
     config = MemoryConfig(
         db_path=str(tmp_path / "test_memory.db"),
         collection_name="test_memories",
+        chive_model_path="/dummy/path",
     )
-    store = MemoryStore(config)
+    store = MemoryStore(config, chive=mock_chive)
     await store.connect()
     yield store
     await store.disconnect()
@@ -152,7 +155,7 @@ async def memory_store(tmp_path):
 async def verb_chain_store(memory_store):
     store = VerbChainStore(
         db=memory_store.db,
-        embedding_fn=memory_store.embedding_fn,
+        chive=memory_store.chive,
     )
     await store.initialize()
     return store
@@ -245,7 +248,7 @@ class TestVerbChainStore:
     async def test_initialize_rebuilds_index(self, memory_store, sample_chain):
         store = VerbChainStore(
             db=memory_store.db,
-            embedding_fn=memory_store.embedding_fn,
+            chive=memory_store.chive,
         )
         await store.initialize()
         await store.save(sample_chain)
@@ -253,7 +256,7 @@ class TestVerbChainStore:
         # Create a new store from the same DB to test initialize
         new_store = VerbChainStore(
             db=memory_store.db,
-            embedding_fn=memory_store.embedding_fn,
+            chive=memory_store.chive,
         )
         await new_store.initialize()
 

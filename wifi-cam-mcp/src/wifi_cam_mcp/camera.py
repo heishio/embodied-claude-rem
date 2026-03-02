@@ -164,6 +164,16 @@ class TapoCamera:
         )
         await self._cam.update_xaddrs()
 
+        # Rewrite xaddrs to use configured host:port (needed for SSH tunnel / port forwarding)
+        from urllib.parse import urlparse, urlunparse
+
+        for ns, url in self._cam.xaddrs.items():
+            parsed = urlparse(url)
+            rewritten = parsed._replace(
+                netloc=f"{self._config.host}:{self._config.onvif_port}"
+            )
+            self._cam.xaddrs[ns] = urlunparse(rewritten)
+
         # Create services
         self._media_service = await self._cam.create_media_service()
         self._ptz_service = await self._cam.create_ptz_service()
@@ -407,7 +417,13 @@ class TapoCamera:
                         for low-bandwidth environments.
         """
         if self._config.stream_url:
-            return self._config.stream_url
+            url = self._config.stream_url
+            # Force IPv4 to avoid IPv6 resolution issues with SSH tunnels
+            url = url.replace("://localhost", "://127.0.0.1")
+            # Inject credentials if not present in URL
+            if "@" not in url and self._config.username and self._config.password:
+                url = url.replace("rtsp://", f"rtsp://{self._config.username}:{self._config.password}@")
+            return url
         stream = "stream2" if sub_stream else "stream1"
         return (
             f"rtsp://{self._config.username}:{self._config.password}"

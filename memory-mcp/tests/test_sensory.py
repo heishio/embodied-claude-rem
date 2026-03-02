@@ -19,11 +19,14 @@ async def memory_store():
     temp_dir = tempfile.mkdtemp(prefix="test_sensory_")
     db_path = os.path.join(temp_dir, "test_memory.db")
 
+    from tests.conftest import MockChiVeEmbedding
+    mock_chive = MockChiVeEmbedding()
     config = MemoryConfig(
         db_path=db_path,
         collection_name="test_memories",
+        chive_model_path="/dummy/path",
     )
-    store = MemoryStore(config)
+    store = MemoryStore(config, chive=mock_chive)
     await store.connect()
     yield store
     await store.disconnect()

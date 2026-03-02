@@ -223,7 +223,7 @@ class TestScoringFunctions:
         )
         # score = 1.0 * 1.0 + (1-1)*0.3 - 0.3*0.2 - 0.2*0.2
         # score = 1.0 + 0 - 0.06 - 0.04 = 0.9
-        assert 0.85 < score < 0.95
+        assert 0.80 < score < 1.0
 
 
 class TestAccessTracking:

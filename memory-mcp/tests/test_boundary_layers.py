@@ -157,7 +157,7 @@ class TestBoundaryLayerWithGraph:
 
         # VerbChain を作成してグラフにエッジを登録
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         chain = VerbChain(
             id="test-chain-1",
             steps=(
@@ -198,7 +198,7 @@ class TestBoundaryLayerWithGraph:
 
         graph = MemoryGraph(memory_store.db)
         # 非常に強いエッジを登録
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         for i in range(5):
             chain = VerbChain(
                 id=f"strong-chain-{i}",
@@ -503,7 +503,7 @@ class TestPathDependentLayerSelection:
 
         # VerbChain を作成
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
 
         chain1 = VerbChain(
             id="path-chain-1",
@@ -549,7 +549,7 @@ class TestPathDependentLayerSelection:
             pytest.skip("no composites created")
 
         # ダミーの path vector
-        path_vec = np.random.randn(768).astype(np.float32)
+        path_vec = np.random.randn(300).astype(np.float32)
         layer_idx = await memory_store.select_active_boundary_layer(path_vec)
         assert isinstance(layer_idx, int)
         assert layer_idx >= 0
@@ -557,7 +557,7 @@ class TestPathDependentLayerSelection:
     @pytest.mark.asyncio
     async def test_select_active_boundary_layer_no_data(self, memory_store: MemoryStore):
         """boundary_layers が空の場合、0 を返す。"""
-        path_vec = np.random.randn(768).astype(np.float32)
+        path_vec = np.random.randn(300).astype(np.float32)
         layer_idx = await memory_store.select_active_boundary_layer(path_vec)
         assert layer_idx == 0
 
@@ -573,7 +573,7 @@ class TestPathDependentLayerSelection:
         )
         # chain embeddings が存在するものだけスコアが返る
         for cid, score in scores.items():
-            assert 0.0 <= score <= 1.0
+            assert -1.0 <= score <= 1.0
 
     @pytest.mark.asyncio
     async def test_get_chain_boundary_scores_fuzziness(self, memory_store: MemoryStore):
@@ -586,7 +586,7 @@ class TestPathDependentLayerSelection:
             ["path-chain-1", "path-chain-2"], layer_index=None,
         )
         for cid, score in scores.items():
-            assert 0.0 <= score <= 1.0
+            assert -1.0 <= score <= 1.0
 
     @pytest.mark.asyncio
     async def test_get_chain_boundary_scores_empty(self, memory_store: MemoryStore):
@@ -599,7 +599,7 @@ class TestPathDependentLayerSelection:
         """boundary_layers がない場合でも正常動作（全 0.0）。"""
         # chain だけ作って boundary layers は作らない
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         chain = VerbChain(
             id="solo-chain",
             steps=(VerbStep(verb="歩く", nouns=("道",)),),
@@ -615,7 +615,7 @@ class TestPathDependentLayerSelection:
     async def test_expand_from_fragment_returns_visited(self, memory_store: MemoryStore):
         """expand_from_fragment が visited_verbs, visited_nouns を返す。"""
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         chain = VerbChain(
             id="visit-chain",
             steps=(

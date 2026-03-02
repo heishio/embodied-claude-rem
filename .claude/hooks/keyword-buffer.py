@@ -2,6 +2,7 @@
 """keyword-buffer.py - 会話キーワードを雑に溜めるフックスクリプト"""
 import json
 import os
+import re
 import sys
 
 text = ""
@@ -23,6 +24,9 @@ if "自律行動タイム" in text:
 # サロゲート文字を除去（Windowsのstdin経由で入ることがある）
 text = text.encode("utf-8", errors="ignore").decode("utf-8")
 
+# <system-reminder>...</system-reminder> タグを除去（ノイズ源）
+text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
+
 try:
     from sudachipy import Dictionary
 
@@ -35,6 +39,26 @@ try:
 except Exception:
     sys.exit(0)
 
+# ノイズ除去: ファイルパスっぽい文字列、システム用語
+_PATH_CHARS = re.compile(r"[/\\.]")
+_NOISE_WORDS = frozenset({
+    "task", "notification", "output", "file", "status", "summary",
+    "Background", "command", "tests", "exit", "Read", "retrieve",
+    "result", "completed", "Users", "AppData", "Local", "Temp",
+    "tasks", "Run", "mcp", "memory", "embodied", "claude", "code",
+    "ClaudeCode",
+})
+
+def _is_noise(surface: str) -> bool:
+    if surface in _NOISE_WORDS:
+        return True
+    if _PATH_CHARS.search(surface):
+        return True
+    # 純粋な英数字のみ（2文字以上）でよくあるID・ハッシュ
+    if re.fullmatch(r"[0-9a-fA-F\-]+", surface):
+        return True
+    return False
+
 # 名詞・固有名詞のみ、2文字以上
 words = []
 # 動詞（原形で保存、出現順を維持）
@@ -42,10 +66,11 @@ verbs = []
 for t in tokens:
     pos = t.part_of_speech()
     if pos[0] == "名詞" and len(t.surface()) >= 2:
-        words.append(t.surface())
+        if not _is_noise(t.surface()):
+            words.append(t.surface())
     elif pos[0] == "動詞":
-        # 辞書形（原形）で保存
-        lemma = t.dictionary_form()
+        # normalized_form（chiVeと一致する表記）で保存
+        lemma = t.normalized_form()
         if len(lemma) >= 2:
             verbs.append(lemma)
 

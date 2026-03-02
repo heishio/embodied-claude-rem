@@ -80,7 +80,7 @@ def calculate_final_score(
     importance_boost: float,
     semantic_weight: float = 1.0,
     decay_weight: float = 0.3,
-    emotion_weight: float = 0.2,
+    emotion_weight: float = 0.0,
     importance_weight: float = 0.2,
 ) -> float:
     """

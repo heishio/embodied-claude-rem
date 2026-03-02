@@ -1,4 +1,7 @@
 {
+  "env": {
+    "MCP_TIMEOUT": "30000"
+  },
   "hooks": {
     "UserPromptSubmit": [
       {

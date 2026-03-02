@@ -64,17 +64,28 @@ class SBV2Engine:
         """
         params: dict[str, Any] = {"text": text}
 
-        model_name = kwargs.get("model_name", self._model_name)
-        if model_name:
-            params["model_name"] = model_name
+        # Explicit model_id override takes priority over model_name
+        if "model_id" in kwargs:
+            params["model_id"] = kwargs["model_id"]
         else:
-            params["model_id"] = kwargs.get("model_id", self._model_id)
+            model_name = kwargs.get("model_name", self._model_name)
+            if model_name:
+                params["model_name"] = model_name
+            else:
+                params["model_id"] = self._model_id
 
         params["speaker_id"] = kwargs.get("speaker_id", self._speaker_id)
         params["style"] = kwargs.get("style", self._style)
         params["style_weight"] = kwargs.get("style_weight", self._style_weight)
         params["length"] = kwargs.get("length", self._length)
         params["language"] = kwargs.get("language", self._language)
+
+        if "sdp_ratio" in kwargs:
+            params["sdp_ratio"] = kwargs["sdp_ratio"]
+        if "noise" in kwargs:
+            params["noise"] = kwargs["noise"]
+        if "noisew" in kwargs:
+            params["noisew"] = kwargs["noisew"]
 
         query = urllib.parse.urlencode(params)
         req = urllib.request.Request(

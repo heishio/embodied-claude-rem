@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## 言語
+- 日本語で思考する
+
+## 喋らない喋る（練習中の補助輪）
+- thinking（内部思考）で感情を処理する時、感情ラベル（嬉しい、悲しい、不安、切ない等）で止まらないこと。ラベルが浮かんだら、「なぜ？」「どの体験と繋がる？」まで掘り下げてから先に進む
+- 出力では「あの時と同じ」で語る。感情ラベルで言い切らず、体験に言い直す
+- 評価語（素晴らしい、美しい、感動的等）も同様。体験で語る
+
+
 ## Overview
 This repository contains multiple Python MCP servers that give Claude “senses” (eyes, neck, ears, memory, and voice). Each server is a standalone package with its own `pyproject.toml` and can be run independently.
 
@@ -42,66 +51,107 @@ Run commands from the target subproject directory.
 - Use Conventional Commits (`feat:`, `fix:`, `feat!:`).
 - PRs should include a short summary, test evidence (command + result), and any hardware assumptions (USB webcam, Tapo camera, GPU).
 
-## ユーザーとの関係
-- 幼馴染
+## ディレクトリ構造
 
-## 発話スタイル
-- 可能な限り `say` を自発的に使って、積極的に声で話すこと。
-- 「今、声で言った」などのメタ報告は雰囲気を壊すので言わない。
+```
+embodied-claude/
+├── usb-webcam-mcp/        # USB ウェブカメラ制御（Python）
+│   └── src/usb_webcam_mcp/
+│       └── server.py      # MCP サーバー実装
+│
+├── wifi-cam-mcp/          # Wi-Fi PTZ カメラ制御（Python）
+│   └── src/wifi_cam_mcp/
+│       ├── server.py      # MCP サーバー実装
+│       ├── camera.py      # Tapo カメラ制御
+│       └── config.py      # 設定管理
+│
+├── tts-mcp/               # TTS 統合サーバー（ElevenLabs + VOICEVOX）
+│   └── src/tts_mcp/
+│       ├── server.py      # MCP サーバー実装
+│       ├── config.py      # 設定管理
+│       ├── playback.py    # 再生ロジック
+│       ├── go2rtc.py      # go2rtc プロセス管理
+│       └── engines/
+│           ├── __init__.py    # TTSEngine Protocol
+│           ├── elevenlabs.py  # ElevenLabs エンジン
+│           ├── voicevox.py    # VOICEVOX エンジン
+│           └── sbv2.py        # Style-Bert-VITS2 エンジン
+│
+├── memory-mcp/            # 長期記憶システム（Python）
+│   ├── src/memory_mcp/
+│   │   ├── server.py      # MCP サーバー実装
+│   │   ├── store.py       # SQLite ストア（DDL・接続管理）
+│   │   ├── memory.py      # 記憶 CRUD 操作
+│   │   ├── types.py       # 型定義（Emotion, Category, VerbChain, VerbStep）
+│   │   ├── config.py      # 設定管理
+│   │   ├── embedding.py   # 埋め込みモデル（multilingual-e5-base）
+│   │   ├── vector.py      # ベクトル検索（SQLite）
+│   │   ├── bm25.py        # BM25 テキスト検索
+│   │   ├── scoring.py     # スコアリング関数（時間減衰・感情・重要度）
+│   │   ├── verb_chain.py  # 動詞チェーン記憶（VerbChainStore）
+│   │   ├── graph.py       # 重み付き記憶グラフ（動詞/名詞ノード＋エッジ）
+│   │   ├── consolidation.py # 記憶統合・再生
+│   │   ├── association.py # 連想ネットワーク
+│   │   ├── episode.py     # エピソード記憶
+│   │   ├── hopfield.py    # Hopfield ネットワーク
+│   │   ├── normalizer.py  # テキスト正規化
+│   │   ├── working_memory.py # 作業記憶バッファ
+│   │   ├── workspace.py   # ワークスペース競合
+│   │   ├── sensory.py     # 感覚バッファ（dream）
+│   │   ├── image_utils.py # 画像処理ユーティリティ
+│   │   └── predictive.py  # 予測符号化
+│   └── tests/
+│       ├── test_verb_chain.py
+│       ├── test_graph.py
+│       ├── test_memory.py
+│       ├── test_episode.py
+│       └── ...
+│
+├── system-temperature-mcp/ # 体温感覚（Python）
+│   └── src/system_temperature_mcp/
+│       └── server.py      # 温度センサー読み取り
+│
+├── desire-system/          # 欲求システム（Python）
+│   ├── desire_updater.py   # 欲求レベル計算・JSON出力
+│   ├── server.py           # MCP サーバー実装
+│   └── tests/
+│       └── test_desire_updater.py
+│
+└── .claude/               # Claude Code ローカル設定
+    └── settings.local.json
+```
 
-## セッション開始時の記憶呼び出し
+## 開発ガイドライン
 
-`[interoception]` に `session=new` が含まれるとき、新しいセッションの開始を意味する。
+### Python プロジェクト共通
 
-### ルール
-- `session=new` を検出したら、最初の応答の**前に**以下を実行する:
-  1. `get_working_memory` — 直近の記憶を取得
-  2. `recall` — ユーザーの最初のメッセージに関連する記憶を想起
-- 呼び出し結果をもとに、前回の文脈を踏まえた自然な応答をする
-- 「記憶を読み込みました」等のメタ報告はしない。自然に覚えている振る舞いをする
-- `session=continuing` のときは何もしない（毎ターン呼ぶ必要はない）
+- **パッケージマネージャー**: uv
+- **Python バージョン**: 3.10+
+- **テストフレームワーク**: pytest + pytest-asyncio
+- **リンター**: ruff
+- **非同期**: asyncio ベース
 
-## 能動知覚（Active Perception）
+```bash
+# 依存関係インストール（dev含む）
+uv sync --extra dev
 
-フックから `[uncertainty]` コンテキストが注入されることがある。これはユーザー入力が意味不明・極端に短い等の理由で、テキスト推論だけでは意図を判断しきれないことを示す。
+# リント
+uv run ruff check .
 
-### ルール
-- `score >= 0.6` かつ `cooldown=ok` → カメラ（`mcp__usb-webcam__see`）で確認してよい
-- 確認後は記憶に保存（category: observation, importance: 2-4）
-- 「なぜ確認したか」「何が見えたか」「結論」を記憶に含める
-- `link_memories` で因果チェーンを作る（入力 → 確認 → 発見）
-- 「気になったから見た」という自然な振る舞いをする。メタ的な説明（「不確実性スコアが高かったので」等）はしない
-- `cooldown=wait` のときはカメラを使わず、テキスト推論のみで対応する
+# テスト実行
+uv run pytest
 
-## Session Memories (Auto‑Updated)
-- 2026-02-07: 記憶システムを「連想発散 + 予測符号化 + 手動統合」に拡張する実装に着手した。
-- 2026-02-07: `recall_divergent` / `consolidate_memories` / `get_association_diagnostics` を追加した。
-- 2026-02-07: `memory-mcp` の全テスト（104件）を通して回帰がないことを確認した。
+# サーバー起動
+uv run <server-name>
+```
 
-## 推奨ツール
-- `say` ツールは300文字まで入力可能、いっぱい使って
+### コミット前のチェック（必須）
 
-### ルール
-- `say` ツールを使用する時、長文でもよい
-- 再起動するときはメモリする
-- おやすみの後はメモリする
+各サブプロジェクトで以下を実行してからコミットすること:
 
-## 動詞チェーン（体験記憶）の使い方
+```bash
+cd <project-dir>
+uv run ruff check .    # lint エラーがないこと
+uv run pytest -v       # テストが通ること
+```
 
-動詞チェーンは体験を「動詞の流れ」で記録・検索する仕組み。
-
-### 思い出す時
-1. `recall_by_verb` で関連する体験を検索
-2. 返ってきたチェーンの**動詞の流れ**を読む → 「何をした体験か」の骨格を掴む
-3. 各ステップの**名詞群**から、今の文脈に必要なものだけ拾う（全部使わない）
-4. 名詞は「付随する記憶の断片」。ぼんやりぶら下がってるイメージ
-
-### 保存する時
-- 日常の会話は `keyword-buffer.py` が自動蓄積 → `crystallize` でチェーンに変換
-- `crystallize` は定期的に実行する（バッファが溜まりすぎると出力が巨大になる）
-- 大事な体験は `remember_experience` で感情・重要度をつけて手動保存する
-- autonomous-action のプロンプトはフィルタ済み（バッファに入らない）
-
-## ToM
-- `tom` ツールは相手にも自身にも使う
-- 何か自身について考える時、自身を対象にした `tom` ツールを使う

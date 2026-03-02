@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import uuid
 from collections import defaultdict
@@ -11,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from .embedding import E5EmbeddingFunction
+from .chive import ChiVeEmbedding
 from .graph import WEIGHTS_RECALL, MemoryGraph
 from .scoring import (
     calculate_emotion_boost,
@@ -29,37 +30,238 @@ class VerbChainStore:
     def __init__(
         self,
         db: sqlite3.Connection,
-        embedding_fn: E5EmbeddingFunction,
+        chive: ChiVeEmbedding,
         graph: MemoryGraph | None = None,
     ):
         self._db = db
-        self._embedding_fn = embedding_fn
+        self._chive = chive
         self._graph = graph
         # 転置インデックス（インメモリ）
         self._noun_to_chain_ids: dict[str, set[str]] = defaultdict(set)
         self._verb_to_chain_ids: dict[str, set[str]] = defaultdict(set)
+        self._bigram_to_chain_ids: dict[str, set[str]] = defaultdict(set)
 
     async def initialize(self) -> None:
-        """起動時に全チェーンから転置インデックスを構築."""
-        rows = await asyncio.to_thread(
-            lambda: self._db.execute(
-                "SELECT id, all_verbs, all_nouns FROM verb_chains"
+        """起動時に転置インデックスを復元（metaテーブルから永続化済みデータを使用）."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        def _load_persisted_index() -> tuple[dict | None, int, int]:
+            """metaテーブルから永続化済みインデックスを読み込む."""
+            row = self._db.execute(
+                "SELECT value FROM meta WHERE key = 'verb_chain_inverted_index'"
+            ).fetchone()
+            if row is None:
+                return None, 0, 0
+
+            try:
+                data = json.loads(row[0])
+                saved_chain_count = data.get("chain_count", 0)
+                current_chain_count = self._db.execute(
+                    "SELECT COUNT(*) FROM verb_chains"
+                ).fetchone()[0]
+                return data, saved_chain_count, current_chain_count
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return None, 0, 0
+
+        data, saved_count, current_count = await asyncio.to_thread(_load_persisted_index)
+
+        if data is not None:
+            # Restore from persisted JSON
+            verb_index = data.get("verb_to_chain_ids", {})
+            noun_index = data.get("noun_to_chain_ids", {})
+            bigram_index = data.get("bigram_to_chain_ids", {})
+            for v, ids in verb_index.items():
+                self._verb_to_chain_ids[v] = set(ids)
+            for n, ids in noun_index.items():
+                self._noun_to_chain_ids[n] = set(ids)
+            for bg, ids in bigram_index.items():
+                self._bigram_to_chain_ids[bg] = set(ids)
+
+            logger.info(
+                "VerbChainStore: restored inverted index from meta "
+                "(saved_chains=%d, current_chains=%d)",
+                saved_count, current_count,
+            )
+
+            # Check for new chains added since last persist
+            if current_count > saved_count:
+                indexed_ids: set[str] = set()
+                for ids in self._verb_to_chain_ids.values():
+                    indexed_ids.update(ids)
+                for ids in self._noun_to_chain_ids.values():
+                    indexed_ids.update(ids)
+
+                def _find_new_chains() -> list[sqlite3.Row]:
+                    rows = self._db.execute(
+                        "SELECT id, all_verbs, all_nouns, steps_json FROM verb_chains"
+                    ).fetchall()
+                    return [
+                        r for r in rows
+                        if (r["id"] if isinstance(r, sqlite3.Row) else r[0])
+                        not in indexed_ids
+                    ]
+
+                new_rows = await asyncio.to_thread(_find_new_chains)
+                for row in new_rows:
+                    chain_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                    verbs_str = row["all_verbs"] if isinstance(row, sqlite3.Row) else row[1]
+                    nouns_str = row["all_nouns"] if isinstance(row, sqlite3.Row) else row[2]
+                    steps_json = row["steps_json"] if isinstance(row, sqlite3.Row) else row[3]
+
+                    for v in verbs_str.split(","):
+                        v = v.strip()
+                        if v:
+                            self._verb_to_chain_ids[v].add(chain_id)
+                    for n in nouns_str.split(","):
+                        n = n.strip()
+                        if n:
+                            self._noun_to_chain_ids[n].add(chain_id)
+                    self._index_bigrams_from_json(chain_id, steps_json)
+
+                if new_rows:
+                    logger.info(
+                        "VerbChainStore: indexed %d new chains incrementally",
+                        len(new_rows),
+                    )
+                    await self._persist_index()
+        else:
+            # No persisted data - full build from DB
+            logger.info("VerbChainStore: no persisted index found, building from scratch")
+
+            rows = await asyncio.to_thread(
+                lambda: self._db.execute(
+                    "SELECT id, all_verbs, all_nouns, steps_json FROM verb_chains"
+                ).fetchall()
+            )
+
+            for row in rows:
+                chain_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+                verbs_str = row["all_verbs"] if isinstance(row, sqlite3.Row) else row[1]
+                nouns_str = row["all_nouns"] if isinstance(row, sqlite3.Row) else row[2]
+                steps_json = row["steps_json"] if isinstance(row, sqlite3.Row) else row[3]
+
+                for v in verbs_str.split(","):
+                    v = v.strip()
+                    if v:
+                        self._verb_to_chain_ids[v].add(chain_id)
+                for n in nouns_str.split(","):
+                    n = n.strip()
+                    if n:
+                        self._noun_to_chain_ids[n].add(chain_id)
+                self._index_bigrams_from_json(chain_id, steps_json)
+
+            if rows:
+                await self._persist_index()
+                logger.info(
+                    "VerbChainStore: built and persisted index for %d chains",
+                    len(rows),
+                )
+
+        # フローベクトルのバックフィル
+        await self._backfill_flow_vectors()
+
+    async def _backfill_flow_vectors(self) -> None:
+        """flow_vector + delta_vector のバックフィル（chiVe 2ベクトル）."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        FLOW_VERSION = "4"  # chiVe 2-vector version
+
+        def _check_migration_needed() -> bool:
+            row = self._db.execute(
+                "SELECT value FROM meta WHERE key = 'flow_vector_version'"
+            ).fetchone()
+            return row is None or row[0] != FLOW_VERSION
+
+        needs_migration = await asyncio.to_thread(_check_migration_needed)
+
+        if needs_migration:
+            def _null_all():
+                self._db.execute("UPDATE verb_chain_embeddings SET flow_vector = NULL, delta_vector = NULL")
+                self._db.commit()
+            await asyncio.to_thread(_null_all)
+            logger.info("VerbChainStore: migrating all flow/delta vectors (v%s)", FLOW_VERSION)
+
+        def _find_missing() -> list[tuple[str, str, str]]:
+            """chain_id, all_verbs, all_nouns のタプルを返す."""
+            rows = self._db.execute(
+                """SELECT vc.id, vc.all_verbs, vc.all_nouns
+                   FROM verb_chains vc
+                   JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id
+                   WHERE vce.flow_vector IS NULL"""
             ).fetchall()
-        )
+            return [(r[0], r[1] or "", r[2] or "") for r in rows]
 
-        for row in rows:
-            chain_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
-            verbs_str = row["all_verbs"] if isinstance(row, sqlite3.Row) else row[1]
-            nouns_str = row["all_nouns"] if isinstance(row, sqlite3.Row) else row[2]
+        missing = await asyncio.to_thread(_find_missing)
+        if not missing:
+            if needs_migration:
+                def _set_version():
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO meta (key, value) VALUES ('flow_vector_version', ?)",
+                        (FLOW_VERSION,),
+                    )
+                    self._db.commit()
+                await asyncio.to_thread(_set_version)
+            return
 
-            for v in verbs_str.split(","):
-                v = v.strip()
-                if v:
-                    self._verb_to_chain_ids[v].add(chain_id)
-            for n in nouns_str.split(","):
-                n = n.strip()
-                if n:
-                    self._noun_to_chain_ids[n].add(chain_id)
+        logger.info("VerbChainStore: backfilling flow/delta vectors for %d chains", len(missing))
+
+        def _update_flow_vectors() -> int:
+            count = 0
+            for chain_id, verbs_str, nouns_str in missing:
+                verbs = [v.strip() for v in verbs_str.split(",") if v.strip()]
+                nouns = [n.strip() for n in nouns_str.split(",") if n.strip()]
+                if not verbs:
+                    continue
+                flow_vec, delta_vec = self._chive.encode_chain(verbs, nouns)
+                concat_vec = np.concatenate([flow_vec, delta_vec])
+                self._db.execute(
+                    "UPDATE verb_chain_embeddings SET vector = ?, flow_vector = ?, delta_vector = ? WHERE chain_id = ?",
+                    (encode_vector(concat_vec), encode_vector(flow_vec), encode_vector(delta_vec), chain_id),
+                )
+                count += 1
+            self._db.commit()
+            return count
+
+        count = await asyncio.to_thread(_update_flow_vectors)
+
+        def _set_version_final():
+            self._db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('flow_vector_version', ?)",
+                (FLOW_VERSION,),
+            )
+            self._db.commit()
+        await asyncio.to_thread(_set_version_final)
+        logger.info("VerbChainStore: backfilled %d flow/delta vectors (v%s)", count, FLOW_VERSION)
+
+    async def _persist_index(self) -> None:
+        """転置インデックスをmetaテーブルにJSON保存."""
+        def _save() -> None:
+            chain_count = self._db.execute(
+                "SELECT COUNT(*) FROM verb_chains"
+            ).fetchone()[0]
+
+            data = {
+                "verb_to_chain_ids": {
+                    k: sorted(v) for k, v in self._verb_to_chain_ids.items()
+                },
+                "noun_to_chain_ids": {
+                    k: sorted(v) for k, v in self._noun_to_chain_ids.items()
+                },
+                "bigram_to_chain_ids": {
+                    k: sorted(v) for k, v in self._bigram_to_chain_ids.items()
+                },
+                "chain_count": chain_count,
+            }
+            self._db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('verb_chain_inverted_index', ?)",
+                (json.dumps(data, ensure_ascii=False),),
+            )
+            self._db.commit()
+
+        await asyncio.to_thread(_save)
 
     def _index_chain(self, chain: VerbChain) -> None:
         """転置インデックスにチェーンを追加."""
@@ -67,11 +269,31 @@ class VerbChainStore:
             self._verb_to_chain_ids[step.verb].add(chain.id)
             for noun in step.nouns:
                 self._noun_to_chain_ids[noun].add(chain.id)
+        for i in range(len(chain.steps) - 1):
+            bigram_key = f"{chain.steps[i].verb}→{chain.steps[i+1].verb}"
+            self._bigram_to_chain_ids[bigram_key].add(chain.id)
+
+    def _index_bigrams_from_json(self, chain_id: str, steps_json: str) -> None:
+        """steps_json文字列からバイグラムを抽出してインデックスに追加."""
+        try:
+            steps_raw = json.loads(steps_json)
+            verbs = [s.get("verb", "") for s in steps_raw if s.get("verb")]
+            for i in range(len(verbs) - 1):
+                bigram_key = f"{verbs[i]}→{verbs[i+1]}"
+                self._bigram_to_chain_ids[bigram_key].add(chain_id)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     async def save(self, chain: VerbChain, category_id: int | None = None) -> VerbChain:
-        """チェーンをSQLiteに保存."""
+        """チェーンをSQLiteに保存（chiVe 2ベクトル）."""
         document = chain.to_document()
         meta = chain.to_metadata()
+
+        # 2ベクトル計算
+        verb_texts = [step.verb for step in chain.steps]
+        noun_texts = list({n for step in chain.steps for n in step.nouns})
+        flow_vec, delta_vec = self._chive.encode_chain(verb_texts, noun_texts)
+        concat_vec = np.concatenate([flow_vec, delta_vec])
 
         def _insert() -> None:
             # Decay freshness only for post-consolidation memories
@@ -110,17 +332,20 @@ class VerbChainStore:
                     1.0,
                 ),
             )
-            # 埋め込みを保存
-            vec = self._embedding_fn([document])[0]
-            vec_bytes = encode_vector(vec)
+            vec_bytes = encode_vector(concat_vec)
+            flow_bytes = encode_vector(flow_vec)
+            delta_bytes = encode_vector(delta_vec)
             self._db.execute(
-                "INSERT OR IGNORE INTO verb_chain_embeddings (chain_id, vector) VALUES (?,?)",
-                (chain.id, vec_bytes),
+                "INSERT OR IGNORE INTO verb_chain_embeddings (chain_id, vector, flow_vector, delta_vector) VALUES (?,?,?,?)",
+                (chain.id, vec_bytes, flow_bytes, delta_bytes),
             )
             self._db.commit()
 
         await asyncio.to_thread(_insert)
         self._index_chain(chain)
+
+        # Persist updated inverted index
+        await self._persist_index()
 
         # Register passive edges in graph
         if self._graph is not None:
@@ -128,7 +353,6 @@ class VerbChainStore:
             nouns_per_step = [list(step.nouns) for step in chain.steps]
             await self._graph.register_chain(verbs, nouns_per_step)
 
-            # Assign nodes to category if specified
             if category_id is not None:
                 await self._graph.assign_chain_nodes_to_category(
                     verbs, nouns_per_step, category_id
@@ -141,11 +365,15 @@ class VerbChainStore:
         query: str,
         n_results: int = 5,
         category_id: int | None = None,
+        flow_weight: float = 0.6,
     ) -> list[tuple[VerbChain, float]]:
-        """意味的類似度でチェーンを検索（スコアリング付き）."""
+        """2軸コサイン類似度でチェーンを検索（スコアリング付き）.
+
+        flow_weight: flow軸の重み (0.0-1.0)。残りがdelta軸。
+        """
 
         def _search_db() -> list[tuple[VerbChain, float]]:
-            # チェーン+埋め込みを取得（カテゴリフィルタ対応）
+            # チェーン+埋め込みを取得
             if category_id is not None:
                 rows = self._db.execute(
                     """WITH RECURSIVE cat_tree(id) AS (
@@ -156,7 +384,7 @@ class VerbChainStore:
                        )
                        SELECT vc.id, vc.document, vc.steps_json, vc.all_verbs, vc.all_nouns,
                               vc.timestamp, vc.emotion, vc.importance, vc.source, vc.context,
-                              vce.vector, vc.freshness
+                              vce.vector, vc.freshness, vce.flow_vector, vce.delta_vector
                        FROM verb_chains vc
                        JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id
                        WHERE vc.category_id IN (SELECT id FROM cat_tree)""",
@@ -166,7 +394,7 @@ class VerbChainStore:
                 rows = self._db.execute(
                     """SELECT vc.id, vc.document, vc.steps_json, vc.all_verbs, vc.all_nouns,
                               vc.timestamp, vc.emotion, vc.importance, vc.source, vc.context,
-                              vce.vector, vc.freshness
+                              vce.vector, vc.freshness, vce.flow_vector, vce.delta_vector
                        FROM verb_chains vc
                        JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id"""
                 ).fetchall()
@@ -174,12 +402,11 @@ class VerbChainStore:
             if not rows:
                 return []
 
-            # クエリ埋め込み
-            query_vec = np.array(self._embedding_fn.encode_query([query])[0])
+            # クエリ 2ベクトル
+            q_flow, q_delta = self._chive.encode_text(query)
 
             # チェーンとベクトルを分離
             chains: list[VerbChain] = []
-            vecs: list[np.ndarray] = []
             for row in rows:
                 chain_id = row[0]
                 metadata = {
@@ -194,17 +421,30 @@ class VerbChainStore:
                     "freshness": row[11] if len(row) > 11 else 1.0,
                 }
                 chains.append(VerbChain.from_metadata(chain_id, metadata))
-                vecs.append(decode_vector(row[10]))
-
-            # バッチ cosine similarity
-            corpus = np.stack(vecs)
-            sims = cosine_similarity(query_vec, corpus)
 
             scored: list[tuple[VerbChain, float]] = []
             now = datetime.now(timezone.utc)
 
             for i, chain in enumerate(chains):
-                semantic_distance = 1.0 - float(sims[i])
+                row = rows[i]
+                flow_blob = row[12] if len(row) > 12 else None
+                delta_blob = row[13] if len(row) > 13 else None
+
+                if flow_blob and delta_blob:
+                    m_flow = decode_vector(bytes(flow_blob))
+                    m_delta = decode_vector(bytes(delta_blob))
+                    flow_sim = float(cosine_similarity(q_flow, m_flow.reshape(1, -1))[0])
+                    delta_sim = float(cosine_similarity(q_delta, m_delta.reshape(1, -1))[0])
+                    sim = flow_weight * flow_sim + (1.0 - flow_weight) * delta_sim
+                else:
+                    # Legacy fallback (skip if dimension mismatch)
+                    legacy_vec = decode_vector(bytes(row[10]))
+                    q_concat = np.concatenate([q_flow, q_delta])
+                    if legacy_vec.shape[0] != q_concat.shape[0]:
+                        continue
+                    sim = float(cosine_similarity(q_concat, legacy_vec.reshape(1, -1))[0])
+
+                semantic_distance = 1.0 - sim
                 time_decay = calculate_time_decay(chain.timestamp, now)
                 emotion_boost = calculate_emotion_boost(chain.emotion)
                 importance_boost = calculate_importance_boost(chain.importance)
@@ -235,6 +475,14 @@ class VerbChainStore:
             return []
         return await self._get_chains_by_ids(chain_ids)
 
+    async def find_by_bigram(self, verb1: str, verb2: str) -> list[VerbChain]:
+        """バイグラムインデックスで動詞ペアからチェーンを検索."""
+        bigram_key = f"{verb1}→{verb2}"
+        chain_ids = list(self._bigram_to_chain_ids.get(bigram_key, set()))
+        if not chain_ids:
+            return []
+        return await self._get_chains_by_ids(chain_ids)
+
     async def bump_chain_edges(self, chain: VerbChain) -> None:
         """Reinforce graph edges when a chain is recalled (active weights)."""
         if self._graph is None:
@@ -247,38 +495,37 @@ class VerbChainStore:
         self,
         verb: str | None = None,
         noun: str | None = None,
+        verb2: str | None = None,
         depth: int = 2,
         n_results: int = 20,
         category_id: int | None = None,
     ) -> tuple[list[VerbChain], list[str], list[str]]:
-        """1つの動詞/名詞から関連チェーンを発見.
-
-        グラフがある場合: weight上位のノードをdepth段展開し、
-        到達したノードから転置インデックスでチェーンID収集、weight順にスコアリング。
-        グラフがない場合: 旧実装（芋づる式全展開）にフォールバック。
-        category_id指定時: グラフ探索もチェーン取得もカテゴリでフィルタ。
-        """
+        """1つの動詞/名詞から関連チェーンを発見."""
         if self._graph is None:
             return await self._expand_from_fragment_legacy(verb=verb, noun=noun, depth=depth)
 
         depth = max(1, min(5, depth))
 
-        # Graph-based expansion: collect nodes by following weighted edges
-        visited_nodes: set[tuple[str, str]] = set()  # (type, surface_form)
-        # Each node has an accumulated score from graph traversal
+        visited_nodes: set[tuple[str, str]] = set()
         node_scores: dict[tuple[str, str], float] = {}
 
-        # Seed nodes
         seeds: list[tuple[str, str]] = []
         if verb:
             seeds.append(("verb", verb))
+        if verb2:
+            seeds.append(("verb", verb2))
         if noun:
             seeds.append(("noun", noun))
+
+        bigram_chain_ids: set[str] = set()
+        if verb and verb2:
+            bigram_key = f"{verb}→{verb2}"
+            bigram_chain_ids = set(self._bigram_to_chain_ids.get(bigram_key, set()))
 
         current_nodes = seeds
         for node in current_nodes:
             visited_nodes.add(node)
-            node_scores[node] = 1.0  # seed nodes have score 1.0
+            node_scores[node] = 1.0
 
         for _ in range(depth):
             if not current_nodes:
@@ -298,12 +545,10 @@ class VerbChainStore:
                         node_scores[key] = propagated
                         next_nodes.append(key)
                     else:
-                        # Update score if this path is stronger
                         if propagated > node_scores.get(key, 0.0):
                             node_scores[key] = propagated
             current_nodes = next_nodes
 
-        # Collect chain IDs from reached nodes via inverted index
         chain_id_scores: dict[str, float] = {}
         for (n_type, n_form), score in node_scores.items():
             if n_type == "verb":
@@ -313,27 +558,29 @@ class VerbChainStore:
                 for cid in self._noun_to_chain_ids.get(n_form, set()):
                     chain_id_scores[cid] = max(chain_id_scores.get(cid, 0.0), score)
 
+        BIGRAM_BONUS = 1.5
+        for cid in bigram_chain_ids:
+            chain_id_scores[cid] = max(
+                chain_id_scores.get(cid, 0.0), BIGRAM_BONUS
+            )
+
         if not chain_id_scores:
             return [], [], []
 
-        # Sort by score descending, take top n_results
         sorted_ids = sorted(chain_id_scores.items(), key=lambda x: x[1], reverse=True)
         top_ids = [cid for cid, _ in sorted_ids[:n_results]]
 
         chains = await self._get_chains_by_ids(top_ids)
 
-        # Filter by category_id at the chain level if specified
         if category_id is not None:
             cat_ids = self._get_descendant_category_ids(category_id)
             chains = [c for c in chains if self._chain_has_category(c.id, cat_ids)]
 
-        # Extract visited verbs and nouns from expansion path
         v_verbs = [sf for t, sf in visited_nodes if t == "verb"]
         v_nouns = [sf for t, sf in visited_nodes if t == "noun"]
         return chains, v_verbs, v_nouns
 
     def _get_descendant_category_ids(self, category_id: int) -> set[int]:
-        """Get category_id and all its descendants via recursive CTE."""
         rows = self._db.execute(
             """WITH RECURSIVE cat_tree(id) AS (
                    SELECT id FROM categories WHERE id = ?
@@ -347,7 +594,6 @@ class VerbChainStore:
         return {int(r[0]) if isinstance(r, tuple) else int(r["id"]) for r in rows}
 
     def _chain_has_category(self, chain_id: str, cat_ids: set[int]) -> bool:
-        """Check if a chain's category_id is in the given set."""
         row = self._db.execute(
             "SELECT category_id FROM verb_chains WHERE id = ?",
             (chain_id,),
@@ -363,12 +609,11 @@ class VerbChainStore:
         noun: str | None = None,
         depth: int = 2,
     ) -> tuple[list[VerbChain], list[str], list[str]]:
-        """Legacy: 転置インデックスのみの芋づる式展開（グラフなし時のフォールバック）."""
+        """Legacy: 転置インデックスのみの芋づる式展開."""
         depth = max(1, min(5, depth))
         visited_chain_ids: set[str] = set()
         result_chains: list[VerbChain] = []
 
-        # 初期シードとなるチェーンID群を収集
         seed_ids: set[str] = set()
         if verb:
             seed_ids.update(self._verb_to_chain_ids.get(verb, set()))
@@ -380,27 +625,20 @@ class VerbChainStore:
         for _ in range(depth):
             if not current_ids:
                 break
-
-            # チェーンを取得
             new_ids = current_ids - visited_chain_ids
             if not new_ids:
                 break
-
             chains = await self._get_chains_by_ids(list(new_ids))
             visited_chain_ids.update(new_ids)
             result_chains.extend(chains)
-
-            # 次の展開: 取得したチェーンの動詞・名詞から新しいチェーンIDを収集
             next_ids: set[str] = set()
             for chain in chains:
                 for step in chain.steps:
                     next_ids.update(self._verb_to_chain_ids.get(step.verb, set()))
                     for n in step.nouns:
                         next_ids.update(self._noun_to_chain_ids.get(n, set()))
-
             current_ids = next_ids - visited_chain_ids
 
-        # Extract visited verbs and nouns from result chains + seeds
         all_verbs: set[str] = set()
         all_nouns: set[str] = set()
         if verb:
@@ -481,25 +719,12 @@ def crystallize_buffer(
     emotion: str = "8",
     importance: int = 3,
     min_verbs: int = 2,
+    merge_threshold: float = 0.2,
 ) -> list[VerbChain]:
-    """sensory_bufferエントリ群からVerbChainを生成.
-
-    連続するエントリ間で共有名詞があれば同じチェーンにグループ化。
-    共有名詞がなくなったら新しいチェーンを開始。
-
-    Args:
-        entries: sensory_buffer.jsonlのパース済みエントリリスト
-        emotion: チェーンに付与する感情
-        importance: チェーンに付与する重要度
-        min_verbs: この数未満のステップのチェーンは破棄
-
-    Returns:
-        生成されたVerbChainリスト
-    """
+    """sensory_bufferエントリ群からVerbChainを生成."""
     if not entries:
         return []
 
-    # エントリをVerbStep群にマップ（動詞がないエントリはスキップ）
     steps_with_nouns: list[tuple[list[VerbStep], set[str]]] = []
     for entry in entries:
         verbs = entry.get("v", [])
@@ -512,21 +737,21 @@ def crystallize_buffer(
     if not steps_with_nouns:
         return []
 
-    # 共有名詞でグループ化
     groups: list[list[tuple[list[VerbStep], set[str]]]] = []
     current_group: list[tuple[list[VerbStep], set[str]]] = [steps_with_nouns[0]]
 
     for i in range(1, len(steps_with_nouns)):
         prev_nouns = current_group[-1][1]
         curr_nouns = steps_with_nouns[i][1]
-        if prev_nouns & curr_nouns:  # 共有名詞あり → 同じグループ
+        shared = prev_nouns & curr_nouns
+        smaller = min(len(prev_nouns), len(curr_nouns))
+        if smaller > 0 and len(shared) / smaller >= merge_threshold:
             current_group.append(steps_with_nouns[i])
         else:
             groups.append(current_group)
             current_group = [steps_with_nouns[i]]
     groups.append(current_group)
 
-    # グループをVerbChainに変換
     chains: list[VerbChain] = []
     timestamp = datetime.now(timezone.utc).isoformat()
 

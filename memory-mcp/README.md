@@ -4,7 +4,9 @@ MCP server for AI long-term memory - Let AI remember across sessions!
 
 ## Overview
 
-This MCP server provides long-term memory capabilities for AI assistants using ChromaDB for vector storage. Memories are stored with semantic embeddings, allowing for intelligent recall based on context.
+This MCP server provides long-term memory capabilities for AI assistants using SQLite + numpy for vector storage. Memories are stored with semantic embeddings, allowing for intelligent recall based on context.
+
+See [DESIGN.md](./DESIGN.md) for the conceptual design.
 
 ## Features
 

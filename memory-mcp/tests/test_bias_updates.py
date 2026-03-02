@@ -178,7 +178,7 @@ class TestConsolidationWithBias:
 
         # VerbChain を作成してグラフにエッジ登録
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         chain = VerbChain(
             id="bias-chain-1",
             steps=(
@@ -274,7 +274,7 @@ class TestConsolidateMemoriesIntegration:
 
         # VerbChain 作成
         graph = MemoryGraph(memory_store.db)
-        chain_store = VerbChainStore(memory_store.db, memory_store.embedding_fn, graph)
+        chain_store = VerbChainStore(memory_store.db, memory_store.chive, graph=graph)
         chain = VerbChain(
             id="integration-chain-1",
             steps=(

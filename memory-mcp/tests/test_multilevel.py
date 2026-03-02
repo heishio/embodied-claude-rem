@@ -47,7 +47,7 @@ class TestMultiLevelSynthesis:
         # level=0 → 1
         stats1 = await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.3,
+            similarity_threshold=0.0,  # mock chiVe
             min_group_size=2,
             source_level=0,
             target_level=1,
@@ -59,7 +59,7 @@ class TestMultiLevelSynthesis:
         # level=1 → 2
         stats2 = await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.3,
+            similarity_threshold=0.0,  # mock chiVe
             min_group_size=2,
             source_level=1,
             target_level=2,
@@ -73,7 +73,7 @@ class TestMultiLevelSynthesis:
     @pytest.mark.asyncio
     async def test_save_composite_level_parameter(self, memory_store: MemoryStore):
         """save_composite の level パラメータが正しく保存されること。"""
-        vec = np.random.randn(768).astype(np.float32)
+        vec = np.random.randn(600).astype(np.float32)
         vec = vec / (np.linalg.norm(vec) + 1e-10)
 
         cid = await memory_store.save_composite(
@@ -176,7 +176,7 @@ class TestOrphanRescue:
         engine = ConsolidationEngine()
         await engine.synthesize_composites(
             store=memory_store,
-            similarity_threshold=0.3,
+            similarity_threshold=0.0,  # mock chiVe uses random vectors
             min_group_size=2,
             source_level=0,
             target_level=1,
@@ -197,7 +197,7 @@ class TestOrphanRescue:
         m2 = await memory_store.save(content="犬が走っている", category="observation")
 
         # m1 だけ composite に入れる
-        vec = np.random.randn(768).astype(np.float32)
+        vec = np.random.randn(600).astype(np.float32)
         vec = vec / (np.linalg.norm(vec) + 1e-10)
         await memory_store.save_composite(
             member_ids=[m1.id],
@@ -224,7 +224,7 @@ class TestOverlapDetection:
     ):
         """類似した composite 間で重なりが検出されること。"""
         # 2つの近いグループを手動で作成
-        dim = 768
+        dim = 600
         base = np.random.randn(dim).astype(np.float32)
         base = base / np.linalg.norm(base)
 
@@ -265,7 +265,7 @@ class TestOverlapDetection:
     @pytest.mark.asyncio
     async def test_no_overlap_with_distant_composites(self, memory_store: MemoryStore):
         """遠い composite 間では重なりが検出されないこと。"""
-        dim = 768
+        dim = 600
 
         m1 = await memory_store.save(content="テスト記憶A", category="daily")
         m2 = await memory_store.save(content="テスト記憶B", category="daily")

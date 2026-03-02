@@ -409,7 +409,7 @@ class CameraMCPServer:
                 match name:
                     case "see":
                         result = await self._camera.capture_image()
-                        return [
+                        contents: list[TextContent | ImageContent] = [
                             ImageContent(
                                 type="image",
                                 data=result.image_base64,
@@ -420,6 +420,11 @@ class CameraMCPServer:
                                 text=f"Captured image at {result.timestamp} ({result.width}x{result.height})",
                             ),
                         ]
+                        recall_hint = ""
+                        contents.append(
+                            TextContent(type="text", text=recall_hint)
+                        )
+                        return contents
 
                     case "look_left":
                         degrees = arguments.get("degrees", 30)
@@ -443,27 +448,27 @@ class CameraMCPServer:
 
                     case "look_around":
                         captures = await self._camera.look_around()
-                        contents: list[TextContent | ImageContent] = []
+                        around_contents: list[TextContent | ImageContent] = []
                         directions = ["Center", "Left", "Right", "Up"]
                         for i, capture in enumerate(captures):
                             direction = directions[i] if i < len(directions) else f"Angle {i}"
-                            contents.append(
+                            around_contents.append(
                                 TextContent(type="text", text=f"--- {direction} View ---")
                             )
-                            contents.append(
+                            around_contents.append(
                                 ImageContent(
                                     type="image",
                                     data=capture.image_base64,
                                     mimeType="image/jpeg",
                                 )
                             )
-                        contents.append(
+                        around_contents.append(
                             TextContent(
                                 type="text",
                                 text=f"Captured {len(captures)} angles. Camera returned to center position.{self._pos_tag()}",
                             )
                         )
-                        return contents
+                        return around_contents
 
                     case "look_front":
                         result = await self._camera.look_front()

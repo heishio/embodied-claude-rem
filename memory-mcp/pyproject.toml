@@ -12,11 +12,11 @@ dependencies = [
     "mcp>=1.0.0",
     "python-dotenv>=1.0.0",
     "Pillow>=10.0.0",
-    "sentence-transformers>=2.0.0",
     "rank-bm25>=0.2.2",
     "sudachipy>=0.6.10",
     "sudachidict-core>=20260116",
     "numpy>=1.24.0",
+    "gensim>=4.0.0",
 ]
 
 [project.optional-dependencies]

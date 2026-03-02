@@ -10,7 +10,7 @@
 
 param(
     [switch]$Loop,
-    [int]$IntervalMinutes = 10
+    [int]$IntervalMinutes = 20
 )
 
 # コンソールとパイプの出力をUTF-8に統一
@@ -43,7 +43,7 @@ $McpConfig = "$ProjectDir\autonomous-mcp.json"
 # --- ツールセット ---
 
 $BaseMemoryTools = @(
-    "mcp__memory__remember",
+    "mcp__memory__diary",
     "mcp__memory__recall",
     "mcp__memory__recall_divergent",
     "mcp__memory__recall_experience",
@@ -51,8 +51,6 @@ $BaseMemoryTools = @(
     "mcp__memory__crystallize",
     "mcp__memory__dream",
     "mcp__memory__list_recent_memories",
-    "mcp__memory__save_visual_memory",
-    "mcp__memory__save_audio_memory",
     "mcp__memory__link_memories",
     "mcp__memory__tom"
 )
@@ -85,8 +83,6 @@ function Get-AllowedTools {
     $tools += $DesireTools
     $tools += $CommonTools
     $tools += $CameraTools
-    $tools += "mcp__tts__say"
-
     return ($tools | Select-Object -Unique) -join ","
 }
 
@@ -102,14 +98,29 @@ function Get-AutonomousState {
     }
     return @{
         session_id = ""
+        last_consolidate_time = ""
+        activity_since_consolidate = 0
     }
 }
 
 function Save-State($State) {
     $Json = @{
         session_id = $State.session_id
+        last_consolidate_time = $State.last_consolidate_time
+        activity_since_consolidate = [int]$State.activity_since_consolidate
     } | ConvertTo-Json
     [System.IO.File]::WriteAllText($StateFile, $Json, $script:Utf8NoBom)
+}
+
+# --- コンソリデート判定（睡眠サイクル） ---
+
+function Test-NeedConsolidate($State) {
+    $activity = [int]($State.activity_since_consolidate)
+    $lastTime = $State.last_consolidate_time
+    if ($activity -lt 3) { return $false }
+    if (-not $lastTime) { return $true }
+    $elapsed = (Get-Date) - [DateTime]::Parse($lastTime)
+    return $elapsed.TotalMinutes -ge 60
 }
 
 # --- 欲求システム ---
@@ -158,7 +169,7 @@ function Build-ActionPrompt([float]$CuriosityLevel) {
 
     return @"
 自律行動タイム！以下を実行して：
-1. look_around で部屋を見回す
+1. see で部屋を見る
 2. 前回と比べて変化があるか確認（人がいる/いない、明るさ、物の位置など）
 3. 気づいたことがあれば記憶に保存（category: observation）
 4. 気になったこと・不思議に思ったことがあれば add_curiosity で好奇心の種を植えて
@@ -173,6 +184,12 @@ function Build-ActionPrompt([float]$CuriosityLevel) {
 function Ensure-SessionId($State) {
     if (-not ($State.PSObject.Properties.Name -contains 'session_id')) {
         $State | Add-Member -NotePropertyName session_id -NotePropertyValue ""
+    }
+    if (-not ($State.PSObject.Properties.Name -contains 'last_consolidate_time')) {
+        $State | Add-Member -NotePropertyName last_consolidate_time -NotePropertyValue ""
+    }
+    if (-not ($State.PSObject.Properties.Name -contains 'activity_since_consolidate')) {
+        $State | Add-Member -NotePropertyName activity_since_consolidate -NotePropertyValue 0
     }
     $State | Add-Member -NotePropertyName _session_is_new -NotePropertyValue $false -Force
     if (-not $State.session_id) {
@@ -218,6 +235,22 @@ function Invoke-AutonomousAction {
     $Prompt = Build-ActionPrompt -CuriosityLevel $CuriosityLevel
     $AllowedTools = Get-AllowedTools
 
+    # 4.5. コンソリデート判定（睡眠サイクル）
+    $NeedConsolidate = Test-NeedConsolidate $State
+    if ($NeedConsolidate) {
+        $ConsolidatePrefix = @"
+【最優先】記憶の整理を実行すること。観察より先に必ずやって：
+1. crystallize を実行（batch_size=0, clear_buffer=true）。結果を報告して
+2. 完了してから通常行動に進んで
+
+"@
+        $Prompt = $ConsolidatePrefix + $Prompt
+        Append-Log $LogFile "--- Consolidate triggered (activity=$($State.activity_since_consolidate)) ---"
+        # コンソリデート時は新規セッションにする（-c継続だと指示が無視される）
+        $State = Reset-SessionId $State
+        Save-State $State
+    }
+
     Append-Log $LogFile "--- Session: $($State.session_id) ---"
     $Mode = if ($CuriosityLevel -ge 0.7) { "curiosity" } else { "observe" }
     Append-Log $LogFile "--- Prompt (mode=$Mode, curiosity=$CuriosityLevel) ---"
@@ -234,10 +267,10 @@ function Invoke-AutonomousAction {
     try {
         if ($State._session_is_new) {
             Append-Log $LogFile "--- New session ---"
-            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p --model haiku --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
+            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p --model sonnet --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
         } else {
             Append-Log $LogFile "--- Continuing session ---"
-            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p -c --model haiku --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
+            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p -c --model sonnet --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
         }
 
         $ExitCode = $LASTEXITCODE
@@ -249,7 +282,7 @@ function Invoke-AutonomousAction {
             Append-Log $LogFile "--- Continue failed (exit=$ExitCode), starting new session ---"
             $State = Reset-SessionId $State
             Save-State $State
-            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p --model haiku --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
+            cmd /c "chcp 65001 >nul & type `"$PromptFile`" | `"$Claude`" -p --model sonnet --mcp-config `"$McpConfig`" --allowedTools `"$AllowedTools`" > `"$TempOut`" 2>&1"
             $OutputText = [System.IO.File]::ReadAllText($TempOut, [System.Text.Encoding]::UTF8)
             Append-Log $LogFile $OutputText
         }
@@ -258,8 +291,16 @@ function Invoke-AutonomousAction {
         Remove-Item $PromptFile -ErrorAction SilentlyContinue
     }
 
+    # 6. コンソリデート状態の更新
+    $State.activity_since_consolidate = [int]($State.activity_since_consolidate) + 1
+    if ($NeedConsolidate) {
+        $State.activity_since_consolidate = 0
+        $State.last_consolidate_time = (Get-Date).ToString("o")
+    }
+    Save-State $State
+
     Append-Log $LogFile "--- Result ---"
-    Append-Log $LogFile "Mode=$Mode Curiosity=$CuriosityLevel Session=$($State.session_id)"
+    Append-Log $LogFile "Mode=$Mode Curiosity=$CuriosityLevel Session=$($State.session_id) Activity=$($State.activity_since_consolidate)"
     Append-Log $LogFile "=== 自律行動終了: $(Get-Date) ==="
 
     Write-Host "[$Timestamp] Done. Mode=$Mode Curiosity=$CuriosityLevel Session=$($State.session_id) Log: $LogFile"
@@ -274,4 +315,5 @@ if ($Loop) {
 } else {
     Invoke-AutonomousAction
 }
+
 

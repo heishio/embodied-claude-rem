@@ -1828,10 +1828,10 @@ Date Range:
                         try:
                             if visited_verbs or visited_nouns:
                                 path_text = " ".join(visited_verbs + visited_nouns)
-                                path_emb = await self._memory_store._encode_query(
+                                path_flow, _ = await self._memory_store._encode_text(
                                     normalize_japanese(path_text)
                                 )
-                                path_vec = np.array(path_emb, dtype=np.float32)
+                                path_vec = path_flow
                                 layer_idx = await self._memory_store.select_active_boundary_layer(path_vec)
                             else:
                                 layer_idx = None
@@ -1980,17 +1980,27 @@ Date Range:
                 return [TextContent(type="text", text=f"Error: {e!s}")]
 
     async def connect_memory(self) -> None:
-        """Connect to memory store (Phase 11: SQLite backend)."""
+        """Connect to memory store (chiVe 2-vector backend)."""
         config = MemoryConfig.from_env()
-        self._memory_store = MemoryStore(config)
+
+        # Initialize chiVe embedding (shared by MemoryStore and VerbChainStore)
+        from .chive import ChiVeEmbedding
+        chive = ChiVeEmbedding(config.chive_model_path)
+        await asyncio.to_thread(chive._load)
+        logger.info("chiVe embedding loaded (%d dims)", chive.vector_size)
+
+        self._memory_store = MemoryStore(config, chive=chive)
         await self._memory_store.connect()
         logger.info(f"Connected to memory store at {config.db_path}")
 
-        # Preload embedding model to avoid cold-start delay on first recall
-        if not self._memory_store.embedding_fn.is_loaded:
-            logger.info("Preloading embedding model...")
-            await asyncio.to_thread(self._memory_store.embedding_fn._load_model)
-            logger.info("Embedding model preloaded")
+        # Run chiVe 2-vector migration if needed
+        migration_stats = await self._memory_store.migrate_to_chive_2vec()
+        if migration_stats["memories_migrated"] > 0 or migration_stats["chains_migrated"] > 0:
+            logger.info(
+                "chiVe migration: %d memories, %d chains migrated",
+                migration_stats["memories_migrated"],
+                migration_stats["chains_migrated"],
+            )
 
         # Episode manager (delegating to MemoryStore)
         self._episode_manager = EpisodeManager(self._memory_store)
@@ -2000,10 +2010,10 @@ Date Range:
         self._memory_graph = MemoryGraph(db=self._memory_store.db)
         logger.info("Memory graph initialized")
 
-        # VerbChainStore (shares DB and embedding function with MemoryStore)
+        # VerbChainStore (shares DB and chiVe with MemoryStore)
         self._verb_chain_store = VerbChainStore(
             db=self._memory_store.db,
-            embedding_fn=self._memory_store.embedding_fn,
+            chive=chive,
             graph=self._memory_graph,
         )
         await self._verb_chain_store.initialize()
