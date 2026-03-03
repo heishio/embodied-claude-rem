@@ -15,8 +15,8 @@
 
 ```mermaid
 flowchart TD
-    A["🗣️ 会話"] -->|自動| B["keyword-buffer\n(hook)"]
-    A -->|手動| C["diary(+steps)\nremember_experience"]
+    A["会話"] -->|自動| B["keyword-buffer\n(hook)"]
+    A -->|手動| C["diary(+steps)"]
 
     B -->|crystallize| D[("memory.db\n(SQLite)")]
     C --> D
@@ -29,15 +29,14 @@ flowchart TD
         D --- V
     end
 
-    subgraph recall ["検索 (3種類)"]
-        R1["recall / search\nrecall_divergent\nベクトル類似度"]
-        R2["recall_experience\nベクトル類似度"]
-        R3["recall_by_verb\nグラフ展開\n芋づる式"]
+    subgraph recall ["検索"]
+        R1["recall\n(quadrant: literal/analogy/surface)"]
+        R2["recall_divergent\n(発散的想起)"]
+        R3["recall_experience\n(quadrant対応)"]
     end
 
     M --> R1
     M --> R2
-    V --> R2
     V --> R3
 
     subgraph consolidate ["consolidate (統合)"]
@@ -91,7 +90,7 @@ flowchart TD
                                                 見る(空) → 気になる(色) → 調べる(天気)
 ```
 
-2ベクトルによるセマンティック検索に加え、動詞・名詞のグラフを芋づる式に展開する検索もできる。
+2ベクトルによるセマンティック検索に、quadrant パラメータ（literal/analogy/surface）で flow/delta の重み比を切り替える4象限検索を搭載。
 
 #### 合成記憶（多段グループ化）
 
@@ -136,7 +135,7 @@ flowchart TD
 | [usb-webcam-mcp](./usb-webcam-mcp/) | 目 | USB カメラから画像取得 | nuroum V11 等 |
 | [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
 | [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
-| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・合成記憶・バウンダリーシステム・ToM（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
+| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・4象限検索・合成記憶・バウンダリーシステム（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
 | [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
 
 ## アーキテクチャ
@@ -360,19 +359,15 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 
 | ツール | 説明 |
 |--------|------|
-| `remember` | 記憶を保存（テキスト/画像付き/音声付き統合。emotion, importance, category 指定可） |
-| `search_memories` | セマンティック検索（フィルタ対応） |
-| `recall` | 文脈に基づく想起（chain_depth>=1 で関連記憶も辿る） |
+| `diary` | 記憶を保存（テキスト/画像/音声統合。steps 付きで動詞チェーンも同時保存） |
+| `update_diary` | 既存記憶を取り消し線+追記で更新 |
+| `recall` | 統合検索（quadrant: literal/analogy/surface、フィルタ、chain_depth 対応） |
 | `recall_divergent` | 連想を発散させた想起 |
-| `link_memories` | 記憶間のリンク作成 |
-| `tom` | Theory of Mind（相手の気持ちの推測） |
-| `consolidate_memories` | 記憶の再生・統合（海馬リプレイ風） |
+| `recall_experience` | 動詞チェーンを意味検索（quadrant 対応） |
 | `list_recent_memories` | 最近の記憶一覧 |
-| `dream` | 感覚バッファの振り返り |
-| `crystallize` | 感覚バッファを動詞チェーン（体験記憶）に変換 |
-| `remember_experience` | 手動で動詞チェーンを作成 |
-| `recall_experience` | 動詞チェーンを意味検索 |
-| `recall_by_verb` | 動詞/名詞から関連チェーンを展開 |
+| `crystallize` | 感覚バッファを動詞チェーンに変換 |
+| `consolidate_memories` | 記憶の再生・統合（海馬リプレイ風） |
+| `rebuild_recall_index` | recall_index を再構築 |
 
 ### system-temperature-mcp
 
