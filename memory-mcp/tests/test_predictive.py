@@ -4,7 +4,6 @@ from memory_mcp.predictive import (
     calculate_context_relevance,
     calculate_novelty_score,
     calculate_prediction_error,
-    query_ambiguity_score,
 )
 from memory_mcp.types import Memory
 
@@ -49,12 +48,3 @@ def test_novelty_decreases_with_activation_count():
     assert novelty_fresh > novelty_replayed
 
 
-def test_query_ambiguity_prefers_short_queries():
-    short_query = "camera"
-    long_query = "camera morning sky balcony cloud and sunlight details"
-
-    short_score = query_ambiguity_score(short_query)
-    long_score = query_ambiguity_score(long_query)
-
-    assert short_score > long_score
-    assert 0.0 <= short_score <= 1.0

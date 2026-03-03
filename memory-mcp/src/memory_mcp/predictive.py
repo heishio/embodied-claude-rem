@@ -59,21 +59,6 @@ def calculate_novelty_score(memory: Memory, prediction_error: float) -> float:
     return max(0.0, min(1.0, novelty))
 
 
-def query_ambiguity_score(context: str) -> float:
-    """Estimate ambiguity of a query in [0, 1]."""
-    tokens = list(context_tokens(context))
-    if not tokens:
-        return 1.0
-
-    token_count = len(tokens)
-    unique_ratio = len(set(tokens)) / token_count
-
-    brevity_score = 1.0 if token_count <= 2 else max(0.0, 1.0 - token_count / 10)
-    repetition_score = 1.0 - unique_ratio
-
-    ambiguity = 0.6 * brevity_score + 0.4 * repetition_score
-    return max(0.0, min(1.0, ambiguity))
-
 
 @dataclass(frozen=True)
 class PredictiveDiagnostics:

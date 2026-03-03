@@ -340,7 +340,6 @@ class MemoryMCPServer:
                         "required": ["context"],
                     },
                 ),
-                # get_association_diagnostics: disabled (debug only)
                 Tool(
                     name="consolidate_memories",
                     description="Run a manual replay/consolidation cycle to strengthen associations and refresh activation metadata.",
@@ -384,14 +383,6 @@ class MemoryMCPServer:
                         "required": [],
                     },
                 ),
-                # get_memory_chain: disabled (rarely used)
-                # Episode tools: disabled (use MEMORY.md for diary-like entries)
-                # create_episode, search_episodes, get_episode_memories
-                # save_visual_memory, save_audio_memory: merged into remember
-                # recall_by_camera_position: disabled (rarely used)
-                # get_working_memory, refresh_working_memory: disabled (rarely used)
-                # Phase 5: Causal Links — link_memories: disabled (verb chains cover causality)
-                # get_causal_chain: disabled (rarely used)
                 Tool(
                     name="tom",
                     description="Theory of Mind: perspective-taking tool. Call this BEFORE responding to understand what the other person is feeling and wanting. Projects your simulated emotions onto them, then swaps perspectives.",
@@ -744,24 +735,6 @@ class MemoryMCPServer:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
-                    case "get_memory_stats":
-                        stats = await self._memory_store.get_stats()
-
-                        output = f"""Memory Statistics:
-Total Memories: {stats.total_count}
-
-By Category:
-{json.dumps(stats.by_category, indent=2, ensure_ascii=False)}
-
-By Emotion:
-{json.dumps(stats.by_emotion, indent=2, ensure_ascii=False)}
-
-Date Range:
-  Oldest: {stats.oldest_timestamp or 'N/A'}
-  Newest: {stats.newest_timestamp or 'N/A'}
-"""
-                        return [TextContent(type="text", text=output)]
-
                     case "recall_divergent":
                         context = arguments.get("context", "")
                         if not context:
@@ -803,24 +776,6 @@ Date Range:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
-                    case "get_association_diagnostics":
-                        context = arguments.get("context", "")
-                        if not context:
-                            return [TextContent(type="text", text="Error: context is required")]
-
-                        diagnostics = await self._memory_store.get_association_diagnostics(
-                            context=context,
-                            sample_size=arguments.get("sample_size", 20),
-                        )
-
-                        return [
-                            TextContent(
-                                type="text",
-                                text="Association diagnostics:\n"
-                                f"{json.dumps(diagnostics, indent=2, ensure_ascii=False)}",
-                            )
-                        ]
-
                     case "consolidate_memories":
                         stats = await self._memory_store.consolidate_memories(
                             window_hours=arguments.get("window_hours", 24),
@@ -856,259 +811,6 @@ Date Range:
                                 type="text",
                                 text="Consolidation completed:\n"
                                 f"{json.dumps(stats, indent=2, ensure_ascii=False)}",
-                            )
-                        ]
-
-                    # Phase 4: Episode Tools
-                    case "create_episode":
-                        if self._episode_manager is None:
-                            return [TextContent(type="text", text="Error: Episode manager not initialized")]
-
-                        title = arguments.get("title", "")
-                        if not title:
-                            return [TextContent(type="text", text="Error: title is required")]
-
-                        memory_ids = arguments.get("memory_ids", [])
-                        if not memory_ids:
-                            return [TextContent(type="text", text="Error: memory_ids is required")]
-
-                        episode = await self._episode_manager.create_episode(
-                            title=title,
-                            memory_ids=memory_ids,
-                            participants=arguments.get("participants"),
-                            auto_summarize=arguments.get("auto_summarize", True),
-                        )
-
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Episode created!\n"
-                                     f"ID: {episode.id}\n"
-                                     f"Title: {episode.title}\n"
-                                     f"Memories: {len(episode.memory_ids)}\n"
-                                     f"Time: {episode.start_time} - {episode.end_time}\n"
-                                     f"Emotion: {episode.emotion}\n"
-                                     f"Importance: {episode.importance}\n"
-                                     f"Summary: {episode.summary[:100]}...",
-                            )
-                        ]
-
-                    case "search_episodes":
-                        if self._episode_manager is None:
-                            return [TextContent(type="text", text="Error: Episode manager not initialized")]
-
-                        query = arguments.get("query", "")
-                        if not query:
-                            return [TextContent(type="text", text="Error: query is required")]
-
-                        episodes = await self._episode_manager.search_episodes(
-                            query=query,
-                            n_results=arguments.get("n_results", 5),
-                        )
-
-                        if not episodes:
-                            return [TextContent(type="text", text="No episodes found matching the query.")]
-
-                        output_lines = [f"Found {len(episodes)} episodes:\n"]
-                        for i, ep in enumerate(episodes, 1):
-                            output_lines.append(
-                                f"--- Episode {i} ---\n"
-                                f"ID: {ep.id}\n"
-                                f"Title: {ep.title}\n"
-                                f"Time: {ep.start_time} - {ep.end_time}\n"
-                                f"Memories: {len(ep.memory_ids)}\n"
-                                f"Emotion: {ep.emotion} | Importance: {ep.importance}\n"
-                                f"Summary: {ep.summary[:80]}...\n"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    case "get_episode_memories":
-                        if self._episode_manager is None:
-                            return [TextContent(type="text", text="Error: Episode manager not initialized")]
-
-                        episode_id = arguments.get("episode_id", "")
-                        if not episode_id:
-                            return [TextContent(type="text", text="Error: episode_id is required")]
-
-                        memories = await self._episode_manager.get_episode_memories(episode_id)
-
-                        output_lines = [f"Episode memories ({len(memories)} total):\n"]
-                        for i, m in enumerate(memories, 1):
-                            output_lines.append(
-                                f"--- Memory {i} ---\n"
-                                f"ID: {m.id}\n"
-                                f"Time: {m.freshness:.2f}\n"
-                                f"Content: {m.content}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    # Phase 4.3: Sensory Integration Tools
-                    case "save_visual_memory":
-                        if self._sensory_integration is None:
-                            return [TextContent(type="text", text="Error: Sensory integration not initialized")]
-
-                        content = arguments.get("content", "")
-                        if not content:
-                            return [TextContent(type="text", text="Error: content is required")]
-
-                        image_path = arguments.get("image_path", "")
-                        if not image_path:
-                            return [TextContent(type="text", text="Error: image_path is required")]
-
-                        camera_pos_data = arguments.get("camera_position")
-                        if not camera_pos_data:
-                            return [TextContent(type="text", text="Error: camera_position is required")]
-
-                        # Create CameraPosition from dict
-                        camera_position = CameraPosition(
-                            pan_angle=camera_pos_data["pan_angle"],
-                            tilt_angle=camera_pos_data["tilt_angle"],
-                            preset_id=camera_pos_data.get("preset_id"),
-                        )
-
-                        memory = await self._sensory_integration.save_visual_memory(
-                            content=content,
-                            image_path=image_path,
-                            camera_position=camera_position,
-                            emotion=arguments.get("emotion", "8"),
-                            importance=arguments.get("importance", 3),
-                            resolution=arguments.get("resolution"),
-                        )
-
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Visual memory saved!\n"
-                                     f"ID: {memory.id}\n"
-                                     f"Content: {memory.content}\n"
-                                     f"Image: {image_path}\n"
-                                     f"Camera: pan={camera_position.pan_angle}°, tilt={camera_position.tilt_angle}°\n"
-                                     f"Emotion: {memory.emotion} | Importance: {memory.importance}",
-                            )
-                        ]
-
-                    case "save_audio_memory":
-                        if self._sensory_integration is None:
-                            return [TextContent(type="text", text="Error: Sensory integration not initialized")]
-
-                        content = arguments.get("content", "")
-                        if not content:
-                            return [TextContent(type="text", text="Error: content is required")]
-
-                        audio_path = arguments.get("audio_path", "")
-                        if not audio_path:
-                            return [TextContent(type="text", text="Error: audio_path is required")]
-
-                        transcript = arguments.get("transcript", "")
-                        if not transcript:
-                            return [TextContent(type="text", text="Error: transcript is required")]
-
-                        memory = await self._sensory_integration.save_audio_memory(
-                            content=content,
-                            audio_path=audio_path,
-                            transcript=transcript,
-                            emotion=arguments.get("emotion", "8"),
-                            importance=arguments.get("importance", 3),
-                        )
-
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Audio memory saved!\n"
-                                     f"ID: {memory.id}\n"
-                                     f"Content: {memory.content}\n"
-                                     f"Audio: {audio_path}\n"
-                                     f"Transcript: {transcript}\n"
-                                     f"Emotion: {memory.emotion} | Importance: {memory.importance}",
-                            )
-                        ]
-
-                    case "recall_by_camera_position":
-                        if self._sensory_integration is None:
-                            return [TextContent(type="text", text="Error: Sensory integration not initialized")]
-
-                        pan_angle = arguments.get("pan_angle")
-                        tilt_angle = arguments.get("tilt_angle")
-
-                        if pan_angle is None or tilt_angle is None:
-                            return [TextContent(type="text", text="Error: pan_angle and tilt_angle are required")]
-
-                        memories = await self._sensory_integration.recall_by_camera_position(
-                            pan_angle=pan_angle,
-                            tilt_angle=tilt_angle,
-                            tolerance=arguments.get("tolerance", 15),
-                        )
-
-                        if not memories:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text=f"No memories found at camera position pan={pan_angle}°, tilt={tilt_angle}°",
-                                )
-                            ]
-
-                        output_lines = [
-                            f"Found {len(memories)} memories at camera position pan={pan_angle}°, tilt={tilt_angle}°:\n"
-                        ]
-                        for i, m in enumerate(memories, 1):
-                            cam_pos = f"pan={m.camera_position.pan_angle}°, tilt={m.camera_position.tilt_angle}°" if m.camera_position else "N/A"
-                            # 視覚記憶のimage_dataを探す
-                            image_line = ""
-                            for sd in m.sensory_data:
-                                if sd.sensory_type == "visual" and sd.image_data:
-                                    image_line = f"Image: data:image/jpeg;base64,{sd.image_data}\n"
-                                    break
-                            output_lines.append(
-                                f"--- Memory {i} ---\n"
-                                f"Time: {m.freshness:.2f}\n"
-                                f"Content: {m.content}\n"
-                                f"Camera: {cam_pos}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
-                                f"{image_line}"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    # Phase 4.4: Working Memory Tools
-                    case "get_working_memory":
-                        working_memory = self._memory_store.get_working_memory()
-                        n_results = arguments.get("n_results", 10)
-
-                        memories = await working_memory.get_recent(n_results)
-
-                        if not memories:
-                            return [
-                                TextContent(
-                                    type="text",
-                                    text="Working memory is empty. No recent memories.",
-                                )
-                            ]
-
-                        output_lines = [
-                            f"Working memory ({len(memories)} recent memories):\n"
-                        ]
-                        for i, m in enumerate(memories, 1):
-                            output_lines.append(
-                                f"--- {i}. [{m.freshness:.2f}] ---\n"
-                                f"Content: {m.content}\n"
-                                f"Emotion: {m.emotion} | Importance: {m.importance}\n"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    case "refresh_working_memory":
-                        working_memory = self._memory_store.get_working_memory()
-
-                        await working_memory.refresh_important(self._memory_store)
-
-                        size = working_memory.size()
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Working memory refreshed. Now contains {size} memories.",
                             )
                         ]
 
