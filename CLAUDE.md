@@ -67,13 +67,10 @@
 |--------|-----------|------|
 | `diary` | content, emotion?, importance?, category?, image_path?, camera_position?, resolution?, audio_path?, transcript?, steps? | 日記エントリ保存（テキスト/画像付き/音声付き統合）。steps を渡すと体験（動詞チェーン）も同時保存 |
 | `update_diary` | memory_id, amendment, emotion?, importance? | 既存日記を取り消し線+追記で更新（元の内容は~~取り消し線~~で残る） |
-| `search_memories` | query, n_results?, filters... | 検索 |
 | `recall` | context, n_results?, chain_depth? | 文脈想起（chain_depth>=1 で関連記憶も辿る） |
 | `recall_divergent` | context, n_results?, max_branches?, max_depth?, temperature?, include_diagnostics? | 発散的想起 |
 | `list_recent_memories` | limit?, category_filter? | 最近一覧 |
 | `consolidate_memories` | window_hours?, max_replay_events?, link_update_strength? | 手動の再生・統合 |
-| `tom` | situation, person?, private? | Theory of Mind: 相手の視点に立って内省 |
-| `dream` | clear? | 感覚バッファ（キーワードログ）を振り返る |
 | `rebuild_recall_index` | なし | recall_indexを再構築（起動時に自動構築済み、通常は不要） |
 
 #### 動詞チェーン（体験記憶）
@@ -85,7 +82,7 @@
 | `crystallize` | emotion?, importance?, min_verbs?, clear_buffer?, batch_size?, offset? | 感覚バッファを自動で動詞チェーンに変換。会話中に溜まったキーワードをまとめる |
 | `remember_experience` | steps[], context?, emotion?, importance? | 手動で動詞チェーンを作成。steps は `{verb, nouns[]}` の配列 |
 | `recall_experience` | context, n_results? | 意味的類似度で動詞チェーンを検索（時間減衰・感情・重要度でスコアリング） |
-| `recall_by_verb` | verb?, noun?, depth?, n_results? | 動詞や名詞から関連チェーンを展開（グラフ重み＋転置インデックス） |
+
 
 **仕組み**: `keyword-buffer.py`（hook）が会話中の名詞・動詞を `sensory_buffer.jsonl` に自動蓄積 → `crystallize` で動詞チェーンに変換 → `recall_experience` / `recall_by_verb` で検索
 
