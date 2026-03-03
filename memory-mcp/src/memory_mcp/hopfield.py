@@ -1,7 +1,6 @@
 """Modern Hopfield Network for associative/pattern-completion memory retrieval.
 
-ChromaDB（意味検索・長期保存）と組み合わせて使う連想記憶レイヤー。
-ChromaDB = 図書館（意味検索）
+組み合わせて使う連想記憶レイヤー。
 Hopfield = 神経回路（パターン補完・連想）
 
 参考: Ramsauer et al. 2020 "Hopfield Networks is All You Need"
@@ -9,7 +8,7 @@ Modern Hopfield Networks are mathematically equivalent to attention in Transform
 
 使い方:
     net = ModernHopfieldNetwork(beta=2.0)
-    net.store(patterns, ids)  # ChromaDB埋め込みをロード
+    net.store(patterns, ids)  # 埋め込みをロード
     retrieved, similarities = net.retrieve(query_embedding)
     closest_id = ids[net.find_closest(similarities)]
 """
