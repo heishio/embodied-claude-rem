@@ -42,11 +42,10 @@ flowchart TD
     subgraph consolidate ["consolidate (統合)"]
         direction TB
         C1["1. freshness 減衰"]
-        C2["2. リンク強化"]
-        C3["3. 合成記憶"]
-        C4["4. バウンダリー"]
-        C5["5. 交差検出"]
-        C1 --> C2 --> C3 --> C4 --> C5
+        C3["2. 合成記憶"]
+        C4["3. バウンダリー"]
+        C5["4. 交差検出"]
+        C1 --> C3 --> C4 --> C5
     end
 
     R1 & R2 & R3 -.->|定期実行| consolidate
@@ -361,7 +360,7 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 |--------|------|
 | `diary` | 記憶を保存（テキスト/画像/音声統合。steps 付きで動詞チェーンも同時保存） |
 | `update_diary` | 既存記憶を取り消し線+追記で更新 |
-| `recall` | 統合検索（quadrant: literal/analogy/surface、フィルタ、chain_depth 対応） |
+| `recall` | 統合検索（quadrant: literal/analogy/surface、freshness フィルタ） |
 | `recall_divergent` | 連想を発散させた想起 |
 | `recall_experience` | 動詞チェーンを意味検索（quadrant 対応） |
 | `list_recent_memories` | 最近の記憶一覧 |
