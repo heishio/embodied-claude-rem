@@ -250,6 +250,23 @@ cd memory-mcp
 uv sync
 ```
 
+##### chiVe モデルのセットアップ
+
+記憶システムは [chiVe](https://github.com/WorksApplications/chiVe)（日本語 word2vec）を使用します。
+
+1. [chiVe リリースページ](https://github.com/WorksApplications/chiVe/releases) から gensim 形式のモデルをダウンロード
+2. `.mcp.json` の memory セクションで `CHIVE_MODEL_PATH` にモデルファイルのパスを設定
+
+```json
+"memory": {
+  "command": "uv",
+  "args": ["run", "--directory", "memory-mcp", "memory-mcp"],
+  "env": {
+    "CHIVE_MODEL_PATH": "/path/to/chive-1.2-mc90.bin"
+  }
+}
+```
+
 #### tts-mcp（声）
 
 ```bash
