@@ -426,26 +426,27 @@ class ConsolidationEngine:
             n_members = len(layer0)
             if n_members == 0:
                 continue
-            # 各レイヤーのlayer0との分類差を取得
+            # 全レイヤーを一括取得（layer0以外）
+            all_rows = db.execute(
+                """SELECT layer_index, member_id, is_edge FROM boundary_layers
+                   WHERE composite_id = ? AND layer_index > 0
+                   ORDER BY layer_index, member_id""",
+                (cid,),
+            ).fetchall()
+            # レイヤー毎にグループ化
+            layers_by_idx: dict[int, list] = {}
+            for r in all_rows:
+                li = r["layer_index"] if not isinstance(r, tuple) else r[0]
+                layers_by_idx.setdefault(li, []).append(r)
+
             for layer_idx in range(1, n_layers + 1):
-                rows = db.execute(
-                    """SELECT member_id, is_edge FROM boundary_layers
-                       WHERE composite_id = ? AND layer_index = ?
-                       ORDER BY member_id""",
-                    (cid, layer_idx),
-                ).fetchall()
+                rows = layers_by_idx.get(layer_idx, [])
                 if len(rows) != n_members:
                     continue
-                layer0_rows = db.execute(
-                    """SELECT member_id, is_edge FROM boundary_layers
-                       WHERE composite_id = ? AND layer_index = 0
-                       ORDER BY member_id""",
-                    (cid,),
-                ).fetchall()
-                # ハミング距離
+                # layer0はメモリ上のcomposite_layer0_mapを使う（DB再読み込み不要）
                 hamming = sum(
-                    1 for l0, lk in zip(layer0_rows, rows)
-                    if l0["is_edge"] != lk["is_edge"]
+                    1 for l0_edge, lk in zip(layer0, rows)
+                    if l0_edge != (lk["is_edge"] if not isinstance(lk, tuple) else lk[2])
                 )
                 shift = hamming / n_members
                 overall_shifts.append(shift)
@@ -460,18 +461,26 @@ class ConsolidationEngine:
         if sum_strengths <= 0:
             return 0
 
+        # update_countを一括取得
+        chain_ids = [t[3] for t in templates]
+        placeholders = ",".join("?" for _ in chain_ids)
+        count_rows = db.execute(
+            f"SELECT chain_id, update_count FROM template_biases WHERE chain_id IN ({placeholders})",
+            chain_ids,
+        ).fetchall()
+        count_map: dict[str, int] = {}
+        for r in count_rows:
+            cid_val = r["chain_id"] if not isinstance(r, tuple) else r[0]
+            cnt = r["update_count"] if not isinstance(r, tuple) else r[1]
+            count_map[cid_val] = int(cnt)
+
         bias_updates: list[tuple[str, float, int]] = []
         for _vec, transient_strength, bias_weight, chain_id in templates:
             proportion = transient_strength / sum_strengths
             shift_contribution = proportion * avg_shift
             old_bias = existing_biases.get(chain_id, 0.0)
             new_bias = min(BIAS_MAX_CAP, old_bias + BIAS_ACCUMULATION_RATE * shift_contribution)
-            # update_count を既存の値から取得
-            row = db.execute(
-                "SELECT update_count FROM template_biases WHERE chain_id = ?",
-                (chain_id,),
-            ).fetchone()
-            old_count = row["update_count"] if row else 0
+            old_count = count_map.get(chain_id, 0)
             bias_updates.append((chain_id, new_bias, old_count + 1))
 
         await store.save_template_biases(bias_updates)
