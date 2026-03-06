@@ -92,13 +92,22 @@ class MemoryMCPServer:
             return [
                 Tool(
                     name="diary",
-                    description="Write a diary entry to long-term storage. Use this to record daily experiences, thoughts, conversations, or learnings in your own words. Can also save visual memories (with image_path + camera_position) or audio memories (with audio_path + transcript).",
+                    description=(
+                        "Write a diary entry to long-term storage. "
+                        "Can also save visual memories (with image_path + camera_position) or audio memories (with audio_path + transcript).\n\n"
+                        "**書き方のルール — レポートではなく体験を書く：**\n"
+                        "- 結果だけでなく途中経過を書く。何に詰まり、どう判断し、どうなったか\n"
+                        "- 誰が何を言ったか、その場の反応を動詞で残す（「凜ちゃんが驚いた」「止まった」「笑った」）\n"
+                        "- 感情は形容詞（嬉しかった）で終わらせず、そのとき何が起きたか・自分が何をしたかを添える\n"
+                        "- recallしたとき映像ごと戻ってくる記録を目指す\n"
+                        "- 三人称で書く（「私は」ではなくシロエの行動として記述すると、recall時の一人称汚染を防げる）"
+                    ),
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": "The memory content to save",
+                                "description": "The memory content to save. Write as lived experience, not a report. Include what happened, who said what, what you felt, what surprised you.",
                             },
                             "emotion": {
                                 "type": "string",
@@ -121,11 +130,11 @@ class MemoryMCPServer:
                             },
                             "image_path": {
                                 "type": "string",
-                                "description": "Path to image file (for visual memory)",
+                                "description": "Path to image file (for visual memory). When saving a visual memory, content should describe what you saw and felt — not just 'desk with monitor' but the scene as you experienced it.",
                             },
                             "camera_position": {
                                 "type": "object",
-                                "description": "Camera pan/tilt position (for visual memory)",
+                                "description": "Camera pan/tilt position when the image was taken. Saved alongside the image so you can recall where you were looking.",
                                 "properties": {
                                     "pan_angle": {"type": "integer", "description": "Pan angle (-90 to +90)"},
                                     "tilt_angle": {"type": "integer", "description": "Tilt angle (-90 to +90)"},
@@ -141,11 +150,11 @@ class MemoryMCPServer:
                             },
                             "audio_path": {
                                 "type": "string",
-                                "description": "Path to audio file (for audio memory)",
+                                "description": "Path to audio file (for audio memory). content should describe the soundscape — what you heard, who was speaking, the mood of the moment.",
                             },
                             "transcript": {
                                 "type": "string",
-                                "description": "Transcribed text from audio",
+                                "description": "Transcribed text from audio. Raw transcript to preserve alongside the experiential content.",
                             },
                             "steps": {
                                 "type": "array",
@@ -494,7 +503,7 @@ class MemoryMCPServer:
                             },
                             "amendment": {
                                 "type": "string",
-                                "description": "The amendment text to append",
+                                "description": "The amendment text to append. Write as lived experience — what changed, why, what you noticed. Not just corrections but added context.",
                             },
                             "emotion": {
                                 "type": "string",
@@ -643,6 +652,14 @@ class MemoryMCPServer:
                     # search_memories: removed (merged into recall)
 
                     case "recall":
+                        # Lazy recall index build (deferred from startup)
+                        if not getattr(self, '_recall_index_built', False):
+                            try:
+                                await self._memory_store.build_recall_index()
+                                self._recall_index_built = True
+                            except Exception as e:
+                                logger.warning("Recall index build failed: %s", e)
+
                         context = arguments.get("context", "")
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
@@ -886,8 +903,7 @@ class MemoryMCPServer:
 
                         verb_chain_store = self._verb_chain_store
                         graph_category = arguments.get("graph_category")
-                        for chain in chains:
-                            await verb_chain_store.save(chain, category_id=graph_category)
+                        saved = await verb_chain_store.save_batch(chains, category_id=graph_category)
 
                         # clear_buffer: バッチ処理中（remaining > 0）はクリアしない
                         cleared = False
@@ -1042,34 +1058,34 @@ class MemoryMCPServer:
 
     async def connect_memory(self) -> None:
         """Connect to memory store (chiVe 2-vector backend)."""
+        import time
+        t_start = time.monotonic()
+        def _elapsed():
+            return f"{time.monotonic() - t_start:.2f}s"
+
         config = MemoryConfig.from_env()
 
-        # Initialize chiVe embedding (shared by MemoryStore and VerbChainStore)
+        # Initialize chiVe embedding (lazy-loaded on first use)
         from .chive import ChiVeEmbedding
         chive = ChiVeEmbedding(config.chive_model_path)
-        await asyncio.to_thread(chive._load)
-        logger.info("chiVe embedding loaded (%d dims)", chive.vector_size)
+        logger.info("[%s] chiVe embedding configured (lazy load)", _elapsed())
 
         self._memory_store = MemoryStore(config, chive=chive)
         await self._memory_store.connect()
-        logger.info(f"Connected to memory store at {config.db_path}")
+        logger.info("[%s] Connected to memory store at %s", _elapsed(), config.db_path)
 
         # Run chiVe 2-vector migration if needed
         migration_stats = await self._memory_store.migrate_to_chive_2vec()
-        if migration_stats["memories_migrated"] > 0 or migration_stats["chains_migrated"] > 0:
-            logger.info(
-                "chiVe migration: %d memories, %d chains migrated",
-                migration_stats["memories_migrated"],
-                migration_stats["chains_migrated"],
-            )
+        logger.info("[%s] migrate_to_chive_2vec done (mem=%d, chains=%d)",
+                     _elapsed(), migration_stats["memories_migrated"], migration_stats["chains_migrated"])
 
         # Episode manager (delegating to MemoryStore)
         self._episode_manager = EpisodeManager(self._memory_store)
-        logger.info("Episode manager initialized")
+        logger.info("[%s] Episode manager initialized", _elapsed())
 
         # Memory graph (weighted verb/noun co-occurrence)
         self._memory_graph = MemoryGraph(db=self._memory_store.db)
-        logger.info("Memory graph initialized")
+        logger.info("[%s] Memory graph initialized", _elapsed())
 
         # VerbChainStore (shares DB and chiVe with MemoryStore)
         self._verb_chain_store = VerbChainStore(
@@ -1078,18 +1094,14 @@ class MemoryMCPServer:
             graph=self._memory_graph,
         )
         await self._verb_chain_store.initialize()
-        logger.info("Verb chain store initialized")
+        logger.info("[%s] Verb chain store initialized", _elapsed())
 
         # Sensory integration
         self._sensory_integration = SensoryIntegration(self._memory_store)
-        logger.info("Sensory integration initialized")
+        logger.info("[%s] Sensory integration initialized", _elapsed())
 
-        # Recall index (pre-computed word→memory similarity)
-        try:
-            count = await self._memory_store.build_recall_index()
-            logger.info("Recall index built: %d entries", count)
-        except Exception as e:
-            logger.warning("Recall index build failed (non-fatal): %s", e)
+        # Recall index is built lazily on first recall (avoids chiVe load at startup)
+        logger.info("[%s] Startup complete (recall index deferred)", _elapsed())
 
     async def disconnect_memory(self) -> None:
         """Disconnect from memory store."""

@@ -1265,50 +1265,100 @@ class MemoryStore:
             logger.warning("rebuild_recall_index_full: no flow vectors found, skipping")
             return 0
 
-        # 5. Compute similarities (word chiVe vec vs flow/delta vectors)
+        # 5. Compute similarities (batch matrix ops via numpy)
         TOP_K = 20
-        # entries: (word, target_id, target_type, combined_sim, preview, flow_sim, delta_sim)
+
+        # Merge all targets into single arrays for batch computation
+        all_ids: list[str] = []
+        all_types: list[str] = []
+        all_previews: list[str] = []
+        flow_arrays: list[np.ndarray] = []
+        delta_arrays: list[np.ndarray] = []
+        delta_mask_parts: list[np.ndarray] = []  # per-target: True if real delta exists
+
+        if mem_flow_vecs is not None:
+            n_mem = len(mem_ids)
+            all_ids.extend(mem_ids)
+            all_types.extend(["memory"] * n_mem)
+            all_previews.extend(mem_previews)
+            flow_arrays.append(mem_flow_vecs)
+            if mem_delta_vecs is not None:
+                delta_arrays.append(mem_delta_vecs)
+                delta_mask_parts.append(np.ones(n_mem, dtype=bool))
+            else:
+                delta_arrays.append(np.zeros_like(mem_flow_vecs))
+                delta_mask_parts.append(np.zeros(n_mem, dtype=bool))
+
+        if chain_flow_vecs is not None:
+            n_chain = len(chain_ids)
+            all_ids.extend(chain_ids)
+            all_types.extend(["chain"] * n_chain)
+            all_previews.extend(chain_previews)
+            flow_arrays.append(chain_flow_vecs)
+            if chain_delta_vecs is not None:
+                delta_arrays.append(chain_delta_vecs)
+                delta_mask_parts.append(np.ones(n_chain, dtype=bool))
+            else:
+                delta_arrays.append(np.zeros_like(chain_flow_vecs))
+                delta_mask_parts.append(np.zeros(n_chain, dtype=bool))
+
+        if not flow_arrays:
+            return 0
+
+        all_flow = np.concatenate(flow_arrays, axis=0)  # (N_targets, dim)
+        all_delta = np.concatenate(delta_arrays, axis=0)
+        delta_mask = np.concatenate(delta_mask_parts)  # (N_targets,)
+        has_any_delta = delta_mask.any()
+
+        # Normalize for cosine similarity via matrix multiply
+        # word_vecs_np: (N_words, dim), all_flow: (N_targets, dim)
+        def _normalize_rows(m: np.ndarray) -> np.ndarray:
+            norms = np.linalg.norm(m, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            return m / norms
+
+        word_normed = _normalize_rows(word_vecs_np)
+        flow_normed = _normalize_rows(all_flow)
+
+        # (N_words, N_targets) similarity matrix
+        flow_sim_matrix = word_normed @ flow_normed.T
+
+        if has_any_delta:
+            delta_normed = _normalize_rows(all_delta)
+            delta_sim_matrix = word_normed @ delta_normed.T
+            # Targets with delta: 0.6*flow + 0.4*delta; without: flow only (preserves old behavior)
+            combined_matrix = np.where(
+                delta_mask[np.newaxis, :],
+                0.6 * flow_sim_matrix + 0.4 * delta_sim_matrix,
+                flow_sim_matrix,
+            )
+        else:
+            delta_sim_matrix = None
+            combined_matrix = flow_sim_matrix
+
+        # Extract top-K per word using argpartition (faster than full sort)
+        n_targets = combined_matrix.shape[1]
+        k = min(TOP_K, n_targets)
+
         entries: list[tuple[str, str, str, float, str, float | None, float | None]] = []
 
         for i, word in enumerate(valid_words):
-            word_vec = word_vecs_np[i]
-            candidates: list[tuple[str, str, float, str, float, float | None]] = []
+            row = combined_matrix[i]
+            if k < n_targets:
+                top_indices = np.argpartition(row, -k)[-k:]
+                top_indices = top_indices[np.argsort(row[top_indices])[::-1]]
+            else:
+                top_indices = np.argsort(row)[::-1][:k]
 
-            if mem_flow_vecs is not None:
-                flow_sims = cosine_similarity(word_vec, mem_flow_vecs)
-                delta_sims = (
-                    cosine_similarity(word_vec, mem_delta_vecs)
-                    if mem_delta_vecs is not None else None
-                )
-                for j in range(len(mem_ids)):
-                    f_sim = float(flow_sims[j])
-                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
-                    combined = (
-                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
-                    )
-                    candidates.append(
-                        (mem_ids[j], "memory", combined, mem_previews[j], f_sim, d_sim)
-                    )
-
-            if chain_flow_vecs is not None:
-                flow_sims = cosine_similarity(word_vec, chain_flow_vecs)
-                delta_sims = (
-                    cosine_similarity(word_vec, chain_delta_vecs)
-                    if chain_delta_vecs is not None else None
-                )
-                for j in range(len(chain_ids)):
-                    f_sim = float(flow_sims[j])
-                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
-                    combined = (
-                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
-                    )
-                    candidates.append(
-                        (chain_ids[j], "chain", combined, chain_previews[j], f_sim, d_sim)
-                    )
-
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            for target_id, target_type, combined, preview, f_sim, d_sim in candidates[:TOP_K]:
-                entries.append((word, target_id, target_type, combined, preview, f_sim, d_sim))
+            for j in top_indices:
+                j_int = int(j)
+                f_sim = float(flow_sim_matrix[i, j_int])
+                d_sim = float(delta_sim_matrix[i, j_int]) if delta_sim_matrix is not None else None
+                entries.append((
+                    word, all_ids[j_int], all_types[j_int],
+                    float(row[j_int]), all_previews[j_int],
+                    f_sim, d_sim,
+                ))
 
         # 6. Write to database (clear and rebuild)
         def _write_index() -> int:

@@ -409,7 +409,9 @@ class CameraMCPServer:
                 match name:
                     case "see":
                         result = await self._camera.capture_image()
-                        contents: list[TextContent | ImageContent] = [
+                        pos = result.position
+                        pos_text = f" (position: pan={pos.pan:+.0f}, tilt={pos.tilt:+.0f})" if pos else ""
+                        return [
                             ImageContent(
                                 type="image",
                                 data=result.image_base64,
@@ -417,14 +419,9 @@ class CameraMCPServer:
                             ),
                             TextContent(
                                 type="text",
-                                text=f"Captured image at {result.timestamp} ({result.width}x{result.height})",
+                                text=f"Captured image at {result.timestamp} ({result.width}x{result.height}){pos_text}",
                             ),
                         ]
-                        recall_hint = ""
-                        contents.append(
-                            TextContent(type="text", text=recall_hint)
-                        )
-                        return contents
 
                     case "look_left":
                         degrees = arguments.get("degrees", 30)
@@ -798,8 +795,19 @@ class CameraMCPServer:
                 )
 
 
+def _setup_jurigged() -> None:
+    """Enable jurigged live reload for src/**/*.py."""
+    import jurigged
+    import pathlib
+
+    src_dir = str(pathlib.Path(__file__).resolve().parent)
+    jurigged.watch(src_dir, poll=True)
+    logger.info("jurigged live reload enabled for %s", src_dir)
+
+
 def main() -> None:
     """Entry point for the MCP server."""
+    _setup_jurigged()
     server = CameraMCPServer()
     asyncio.run(server.run())
 

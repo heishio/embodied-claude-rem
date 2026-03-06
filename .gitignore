@@ -64,6 +64,17 @@ autonomous-state.json
 # go2rtc config (contains camera credentials)
 go2rtc-config.yaml
 
+# Autonomous action logs and session
+.autonomous-logs/
+.heartbeat-session-id
+heartbeat-session-id
+last-session-date.txt
+
+# User-specific config (use *.sample.conf as template)
+schedule.conf
+desires.conf
+desires.json
+
 # Local settings (may contain credentials)
 .claude/settings.local.json
 

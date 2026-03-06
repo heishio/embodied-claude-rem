@@ -79,7 +79,7 @@ if not query_words:
 
 # ── DB接続 ──
 
-db_path = os.path.join(os.path.expanduser("~"), ".claude", "memories", "memory.db")
+db_path = os.environ.get("MEMORY_DB_PATH", os.path.join(os.path.expanduser("~"), ".claude", "memories", "memory.db"))
 if not os.path.exists(db_path):
     sys.exit(0)
 
