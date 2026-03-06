@@ -21,6 +21,7 @@ class CameraConfig:
     max_width: int = 1920
     max_height: int = 1080
     mount_mode: str = "normal"  # "normal" (desktop) or "ceiling" (inverted)
+    osd_flip_detect: bool = False  # Auto-detect upside-down via OSD text position
 
     @classmethod
     def from_env(cls, prefix: str = "TAPO") -> "CameraConfig":
@@ -43,6 +44,9 @@ class CameraConfig:
         ).lower()
         if mount_mode not in ("normal", "ceiling"):
             raise ValueError(f"Invalid mount mode '{mount_mode}'. Must be 'normal' or 'ceiling'.")
+        osd_flip_detect = (
+            os.getenv(f"{prefix}_OSD_FLIP_DETECT", "") or os.getenv("TAPO_OSD_FLIP_DETECT", "")
+        ).lower() in ("1", "true", "yes")
         max_width = int(os.getenv("CAPTURE_MAX_WIDTH", "1920"))
         max_height = int(os.getenv("CAPTURE_MAX_HEIGHT", "1080"))
 
@@ -61,6 +65,7 @@ class CameraConfig:
             stream_url=stream_url,
             listen_url=listen_url,
             mount_mode=mount_mode,
+            osd_flip_detect=osd_flip_detect,
             max_width=max_width,
             max_height=max_height,
         )
