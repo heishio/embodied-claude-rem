@@ -203,3 +203,47 @@ DB の配置先が環境によって異なる場合に対応。
 - 過去のトランスクリプトから `sensory_buffer.jsonl` にキーワードを一括追記するユーティリティ
 - `ccconv raws --format=talk` → sudachipy で名詞・動詞抽出
 - `backfill-keywords.sh` の `trap` 内 `$TMPFILE` クオート修正済み
+
+---
+
+## 9. OSD フリップ検出 + jurigged ライブリロード + camera_info MountMode (`ba0a0cd`)
+
+### 変更ファイル
+
+- `wifi-cam-mcp/pyproject.toml`
+- `wifi-cam-mcp/src/wifi_cam_mcp/camera.py`
+- `wifi-cam-mcp/src/wifi_cam_mcp/server.py`
+- `wifi-cam-mcp/uv.lock`
+
+### 変更点
+
+**camera.py:**
+- OSD（タイムスタンプ/ロゴ）の位置から画像の上下反転を検出する `_detect_flip_from_osd()` を追加
+- ピクセル走査を `np.frombuffer` + `np.count_nonzero` で行列演算化（Python ループ回避）
+- `camera_info` レスポンスに `MountMode` フィールドを追加（`mcpBehavior.toml` の値を優先、なければ config のデフォルト）
+
+**server.py:**
+- `_setup_jurigged()` を追加。起動時に `jurigged.watch()` で `src/` 以下の `.py` ファイルを監視し、ホットリロードを有効化
+- 通常依存として `jurigged>=0.6.0` を追加（`try/except ImportError` なし）
+
+**pyproject.toml:**
+- `numpy>=1.24.0`, `jurigged>=0.6.0` を dependencies に追加
+
+### コードの意図
+
+**OSD フリップ検出:**
+Tapo カメラは OSD テキスト（タイムスタンプ・ロゴ）を画像の固定コーナーに描画する。Normal では左上/左下、Flipped（天井取付等で上下反転）では右下/右上に出る。各コーナーの「OSD白」（輝度 >= 230）のピクセル比率を比較し、右側が高ければ反転と判定する。差分が閾値未満（白壁等で判定不能）のときは補正しない。
+
+`mcpBehavior.toml` の `osd_flip_detect = true` で opt-in。デフォルト無効。
+
+**ceiling モードとの共存:**
+ceiling モードは入力（パン/チルト方向）と画像の両方を 180° 反転する操作体系。OSD 検出は ceiling 回転の**後に**走るが、ceiling 回転後の画像では OSD が正常位置に戻るため、OSD 検出が「正常」と判定して追加回転しない。つまり二重回転は発生しない。
+
+**jurigged ライブリロード:**
+MCP サーバーの再起動なしにコード変更を反映できる。`mcpBehavior.toml` のライブリロードと合わせて、開発中の試行錯誤を高速化する。
+
+### 解決する問題
+
+- カメラの取付状態が変わった際に `mount_mode` 設定を変え忘れても、OSD 検出で画像の上下を自動補正できる
+- MCP サーバーの再起動なしにカメラ制御コードを変更可能
+- `camera_info` から現在の `MountMode` を確認可能（設定ミスの発見に有用）
