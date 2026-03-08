@@ -10,10 +10,18 @@
 BUFFER_FILE="/tmp/hearing_buffer.jsonl"
 PID_FILE="/tmp/hearing-daemon.pid"
 OFFSET_FILE="/tmp/hearing_stop_offset"
+TIMING_LOG="/tmp/hearing_timing.log"
+
+# タイミング記録
+NOW=$(python3 -c "import time; print(f'{time.time():.3f}')")
+PREV=$(cat /tmp/hearing_stop_last_ts 2>/dev/null || echo "$NOW")
+DELTA=$(python3 -c "print(f'{$NOW - $PREV:.1f}')")
+echo "$NOW" > /tmp/hearing_stop_last_ts
+echo "[$(date +%H:%M:%S)] stop-hook-start delta=${DELTA}s count=${COUNT:-?}" >> "$TIMING_LOG"
 MAX_HEARING_CONTINUES=${MAX_HEARING_CONTINUES:-5}
 COUNTER_FILE="/tmp/hearing-stop-counter"
-WAIT_SECONDS=${HEARING_WAIT_SECONDS:-12}
-RETRY_WAIT=${HEARING_RETRY_WAIT:-4}
+WAIT_SECONDS=${HEARING_WAIT_SECONDS:-5}
+RETRY_WAIT=${HEARING_RETRY_WAIT:-3}
 NO_SPEECH_THRESHOLD=${HEARING_NO_SPEECH_THRESHOLD:-0.6}
 
 # ── デーモン稼働確認 ──────────────────────────────────────────
@@ -39,7 +47,7 @@ fi
 sleep "$WAIT_SECONDS"
 
 # ── バッファを行番号ベースで読み取り・判定 ─────────────────────
-RESULT=$(python3 - "$NO_SPEECH_THRESHOLD" "$OFFSET_FILE" "$BUFFER_FILE" "$RETRY_WAIT" <<'PYEOF' 2>/dev/null
+RESULT=$(python3 - "$NO_SPEECH_THRESHOLD" "$OFFSET_FILE" "$BUFFER_FILE" "$RETRY_WAIT" "$COUNT" <<'PYEOF' 2>>/tmp/hearing_timing.log
 import json
 import os
 import sys
@@ -122,31 +130,54 @@ def try_read():
     combined = " / ".join(texts)
     return f"[hearing] chunks={n} span={first_ts}~{last_ts} text={combined}", total
 
-# 1回目
-result, total = try_read()
-if result:
-    print(result)
-    sys.exit(0)
+# チェーン保証回数: バッファが空でもこの回数まではリトライする
+MIN_GUARANTEED = 2
+count = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+t_start = time.time()
 
-# 無効 → 即リトライ（新データを待つ）
-time.sleep(retry_wait)
-result, total = try_read()
-if result:
-    print(result)
-    sys.exit(0)
+debug_lines = []
+# 最大3回リトライ（retry_wait間隔）
+for attempt in range(3):
+    result, total = try_read()
+    elapsed = time.time() - t_start
+    debug_lines.append(f"  retry{attempt}: {'HIT' if result else 'empty'} buf_lines={total} +{elapsed:.1f}s")
+    if result:
+        # デバッグ情報を結果の後ろに付与
+        debug = " | ".join(debug_lines)
+        print(f"{result} [debug: count={count} {debug}]")
+        sys.exit(0)
+    # バッファ空でも保証回数以内ならリトライ
+    if count >= MIN_GUARANTEED:
+        debug_lines.append(f"  => skip retry (count={count} >= guaranteed={MIN_GUARANTEED})")
+        break
+    time.sleep(retry_wait)
 
-# 2回目も無効 → 終了（バッファはそのまま残る）
+# 全リトライ失敗時もデバッグ出力
+debug = " | ".join(debug_lines)
+print(f"[hearing-debug] no speech. count={count} {debug}", file=sys.stderr)
 sys.exit(0)
 PYEOF
 )
 
 # ── 判定 ──────────────────────────────────────────────────────
+END_TS=$(python3 -c "import time; print(f'{time.time():.3f}')")
 if [ -n "$RESULT" ]; then
     echo $((COUNT + 1)) > "$COUNTER_FILE"
+    ELAPSED=$(python3 -c "print(f'{$END_TS - $NOW:.1f}')")
+    echo "[$(date +%H:%M:%S)] stop-hook-block elapsed=${ELAPSED}s chain=$((COUNT+1))" >> "$TIMING_LOG"
     ESCAPED=$(echo "$RESULT" | sed 's/"/\\"/g')
     echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n${ESCAPED}\nチェイン($((COUNT+1))/${MAX_HEARING_CONTINUES})\"}"
 else
-    # 発話なし → カウンタリセットして終了
-    rm -f "$COUNTER_FILE"
-    exit 0
+    ELAPSED=$(python3 -c "print(f'{$END_TS - $NOW:.1f}')")
+    # チェーン保証: 保証回数以内なら空でもblockして待機
+    MIN_GUARANTEED=2
+    if [ "$COUNT" -lt "$MIN_GUARANTEED" ]; then
+        echo $((COUNT + 1)) > "$COUNTER_FILE"
+        echo "[$(date +%H:%M:%S)] stop-hook-wait elapsed=${ELAPSED}s chain=$((COUNT+1)) (guaranteed)" >> "$TIMING_LOG"
+        echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n[hearing] 聞き取り待機中... ($((COUNT+1))/${MAX_HEARING_CONTINUES})\nまだ聞き取れていないけど、静かに続きを待っています。\"}"
+    else
+        echo "[$(date +%H:%M:%S)] stop-hook-pass elapsed=${ELAPSED}s (no speech)" >> "$TIMING_LOG"
+        rm -f "$COUNTER_FILE"
+        exit 0
+    fi
 fi

@@ -9,6 +9,14 @@
 
 BUFFER_FILE="/tmp/hearing_buffer.jsonl"
 PID_FILE="/tmp/hearing-daemon.pid"
+TIMING_LOG="/tmp/hearing_timing.log"
+
+# タイミング記録
+NOW=$(python3 -c "import time; print(f'{time.time():.3f}')")
+PREV=$(cat /tmp/hearing_hook_last_ts 2>/dev/null || echo "$NOW")
+DELTA=$(python3 -c "print(f'{$NOW - $PREV:.1f}')")
+echo "$NOW" > /tmp/hearing_hook_last_ts
+echo "[$(date +%H:%M:%S)] submit-hook  delta=${DELTA}s" >> "$TIMING_LOG"
 
 # ── デーモン稼働確認 ──────────────────────────────────────────────────────────
 
@@ -80,6 +88,9 @@ first_ts = fmt_time(entries[0]["ts"])
 last_ts  = fmt_time(entries[-1]["ts"])
 texts    = [e["text"] for e in entries]
 combined = " / ".join(texts)
+
+# チェーン保証フラグ: stop hookが最低1回は待つようにする
+Path("/tmp/hearing_had_speech").write_text(str(n))
 
 # interoception.sh に合わせた key=value 形式で出力
 print(f"[hearing] chunks={n} span={first_ts}~{last_ts} text={combined}")
