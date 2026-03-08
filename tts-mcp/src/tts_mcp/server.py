@@ -209,9 +209,9 @@ class TTSMCP:
 
             pb = self._config.playback
             play_audio = arguments.get("play_audio", pb.play_audio)
-            speaker_target = arguments.get("speaker") or (
-                "both" if pb.go2rtc_url else "local"
-            )
+            from ._behavior import get_behavior
+            default_speaker = get_behavior("tts", "speaker", "both" if pb.go2rtc_url else "local")
+            speaker_target = arguments.get("speaker") or default_speaker
             use_local = speaker_target in {"local", "both"}
             use_camera = speaker_target in {"camera", "both"} and pb.go2rtc_url
 
@@ -378,7 +378,18 @@ class TTSMCP:
                 self._go2rtc.stop()
 
 
+def _setup_jurigged() -> None:
+    """Enable jurigged live reload for src/**/*.py."""
+    import jurigged
+    import pathlib
+
+    src_dir = str(pathlib.Path(__file__).resolve().parent)
+    jurigged.watch(src_dir, poll=True)
+    logger.info("jurigged live reload enabled for %s", src_dir)
+
+
 def main() -> None:
+    _setup_jurigged()
     asyncio.run(TTSMCP().run())
 
 
