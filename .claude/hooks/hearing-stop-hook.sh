@@ -11,6 +11,10 @@ BUFFER_FILE="/tmp/hearing_buffer.jsonl"
 PID_FILE="/tmp/hearing-daemon.pid"
 OFFSET_FILE="/tmp/hearing_stop_offset"
 TIMING_LOG="/tmp/hearing_timing.log"
+CONTEXT_FILE="/tmp/hearing_context.json"
+
+# stdinからコンテキストを保存（1回だけ読める）
+cat > "$CONTEXT_FILE"
 
 # タイミング記録
 NOW=$(python3 -c "import time; print(f'{time.time():.3f}')")
@@ -112,6 +116,57 @@ def fmt_time(ts):
         return ts.split("T")[1][:8]
     return ts
 
+def llm_filter(texts):
+    """claude -p でハルシネーション判定。実際の発話だけ返す。"""
+    import subprocess as sp
+    combined = " / ".join(texts)
+
+    # コンテキスト読み込み
+    context_parts = []
+    user_prompt = Path("/tmp/hearing_user_prompt.txt")
+    context_json = Path("/tmp/hearing_context.json")
+    if user_prompt.exists():
+        up = user_prompt.read_text().strip()
+        if up:
+            context_parts.append(f"直前のユーザー入力: {up[:200]}")
+    if context_json.exists():
+        try:
+            import json as _j
+            ctx = _j.loads(context_json.read_text())
+            lam = ctx.get("last_assistant_message", "")
+            if lam:
+                context_parts.append(f"直前のClaude応答: {lam[:200]}")
+        except Exception:
+            pass
+    context_str = "\n".join(context_parts) if context_parts else "(コンテキストなし)"
+
+    prompt = (
+        "あなたは音声認識フィルタです。会話の文脈と音声認識結果を見て判定してください。\n\n"
+        f"【会話の文脈】\n{context_str}\n\n"
+        f"【音声認識(Whisper)の出力】\n{combined}\n\n"
+        "【タスク】\n"
+        "1. 音声認識結果から、実際に人が喋った言葉だけを抽出してください\n"
+        "2. Whisperのハルシネーション(「ご視聴ありがとう」「さようなら」「チャンネル登録」等の定型句、"
+        "意味不明な繰り返し、文脈と無関係なフレーズ)は除去してください\n"
+        "3. 実際の発話が1つもなければ EMPTY とだけ返してください\n"
+        "4. 実際の発話があれば、そのテキストだけを返してください。余計な説明は不要です"
+    )
+    try:
+        env = {**os.environ, "CLAUDECODE": ""}
+        env.pop("CLAUDECODE", None)
+        r = sp.run(
+            ["claude", "-p", "--model", "haiku", prompt],
+            capture_output=True, text=True, timeout=10,
+            env=env,
+        )
+        out = r.stdout.strip()
+        if not out or out == "EMPTY":
+            return None
+        return out
+    except Exception as e:
+        print(f"[hearing-debug] llm_filter error: {e}", file=sys.stderr)
+        return combined  # フォールバック: フィルタなしで通す
+
 def try_read():
     offset = read_offset()
     lines, total = read_buffer_from(offset)
@@ -120,15 +175,21 @@ def try_read():
     entries = filter_entries(lines)
     if not entries:
         return None, total
+    # 有効 → LLMフィルタ
+    texts = [e["text"] for e in entries]
+    filtered = llm_filter(texts)
+    if not filtered:
+        # LLMがハルシネーションと判定 → バッファは切り詰めるが結果なし
+        last_line_no = lines[-1][0]
+        truncate_buffer(last_line_no + 1)
+        return None, total
     # 有効 → 出力 & バッファ切り詰め
     last_line_no = lines[-1][0]
     truncate_buffer(last_line_no + 1)
     n = len(entries)
     first_ts = fmt_time(entries[0]["ts"])
     last_ts = fmt_time(entries[-1]["ts"])
-    texts = [e["text"] for e in entries]
-    combined = " / ".join(texts)
-    return f"[hearing] chunks={n} span={first_ts}~{last_ts} text={combined}", total
+    return f"[hearing] chunks={n} span={first_ts}~{last_ts} text={filtered}", total
 
 # チェーン保証回数: バッファが空でもこの回数まではリトライする
 MIN_GUARANTEED = 2

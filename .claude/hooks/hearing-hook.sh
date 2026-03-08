@@ -10,6 +10,10 @@
 BUFFER_FILE="/tmp/hearing_buffer.jsonl"
 PID_FILE="/tmp/hearing-daemon.pid"
 TIMING_LOG="/tmp/hearing_timing.log"
+USER_PROMPT_FILE="/tmp/hearing_user_prompt.txt"
+
+# stdinからユーザーのプロンプトを保存
+jq -r '.prompt // empty' > "$USER_PROMPT_FILE"
 
 # タイミング記録
 NOW=$(python3 -c "import time; print(f'{time.time():.3f}')")
