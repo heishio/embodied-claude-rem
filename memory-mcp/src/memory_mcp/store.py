@@ -531,22 +531,40 @@ class MemoryStore:
 
         def _insert() -> None:
             meta = memory.to_metadata()
-            # Decay freshness only for post-consolidation memories
-            cutoff = db.execute(
-                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
+            # Throttled age-proportional freshness decay
+            last_decay = db.execute(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_freshness_decay_at'), '')"
             ).fetchone()[0]
-            if cutoff:
-                db.execute(
-                    "UPDATE memories SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
-                    (cutoff,),
+            should_decay = True
+            if last_decay:
+                try:
+                    last_dt = datetime.fromisoformat(last_decay)
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                    should_decay = elapsed >= 3600  # 1 hour throttle
+                except ValueError:
+                    pass
+            if should_decay:
+                # Age-proportional: newer memories decay slower, older decay faster
+                # rate = min(0.01, 0.0003 * age_days) per tick
+                cutoff = db.execute(
+                    "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
+                ).fetchone()[0]
+                age_decay_sql = (
+                    "SET freshness = MAX(0.01, freshness * (1.0 - MIN(0.01, "
+                    "0.0003 * MAX(0, julianday('now') - julianday(timestamp)))))"
                 )
+                if cutoff:
+                    db.execute(f"UPDATE memories {age_decay_sql} WHERE timestamp > ?", (cutoff,))
+                    db.execute(f"UPDATE verb_chains {age_decay_sql} WHERE timestamp > ?", (cutoff,))
+                else:
+                    db.execute(f"UPDATE memories {age_decay_sql}")
+                    db.execute(f"UPDATE verb_chains {age_decay_sql}")
                 db.execute(
-                    "UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
-                    (cutoff,),
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_freshness_decay_at', ?)",
+                    (datetime.now(timezone.utc).isoformat(),),
                 )
-            else:
-                db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - 0.003)")
-                db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003)")
             db.execute(
                 """INSERT INTO memories (
                     id, content, normalized_content, timestamp,
@@ -909,12 +927,20 @@ class MemoryStore:
     # ── freshness ───────────────────────────────
 
     async def decay_all_freshness(self, amount: float = 0.003) -> None:
-        """全記憶・チェーンの freshness を微量減少させる。"""
+        """全記憶・チェーンの freshness を age 比例で減少させる。
+
+        amount は後方互換のために残すが、実際は age 比例の乗算decay を使う。
+        rate = min(0.01, 0.0003 * age_days) per tick。
+        """
         db = self._ensure_connected()
 
         def _decay() -> None:
-            db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - ?)", (amount,))
-            db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - ?)", (amount,))
+            age_decay_sql = (
+                "SET freshness = MAX(0.01, freshness * (1.0 - MIN(0.01, "
+                "0.0003 * MAX(0, julianday('now') - julianday(timestamp)))))"
+            )
+            db.execute(f"UPDATE memories {age_decay_sql}")
+            db.execute(f"UPDATE verb_chains {age_decay_sql}")
             db.commit()
 
         await asyncio.to_thread(_decay)
