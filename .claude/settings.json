@@ -3,6 +3,18 @@
     "MCP_TIMEOUT": "30000"
   },
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__wifi-cam__see|mcp__usb-webcam__see",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-see-embed.cmd",
+            "timeout": 35
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -20,6 +32,11 @@
             "type": "command",
             "command": ".claude/hooks/run-recall-lite.cmd",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-passive-vision.cmd",
+            "timeout": 5
           }
         ]
       }

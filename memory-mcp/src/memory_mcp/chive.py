@@ -64,11 +64,16 @@ class ChiVeEmbedding:
     def _load(self) -> None:
         if self._wv is not None:
             return
-        from gensim.models import Word2Vec
+        from gensim.models import KeyedVectors
         logger.info("Loading chiVe model from %s ...", self._model_path)
-        model = Word2Vec.load(self._model_path)
-        self._wv = model.wv
-        del model  # free training weights
+        p = self._model_path.lower()
+        if p.endswith(".kv") or p.endswith(".kv.vectors.npy"):
+            self._wv = KeyedVectors.load(self._model_path)
+        else:
+            from gensim.models import Word2Vec
+            model = Word2Vec.load(self._model_path)
+            self._wv = model.wv
+            del model  # free training weights
         logger.info("chiVe loaded: %d words, %d dims", len(self._wv), self._wv.vector_size)
 
     def _ensure_loaded(self) -> KeyedVectors:

@@ -204,6 +204,128 @@ class ConsolidationEngine:
             "composites_skipped": composites_skipped,
         }
 
+    async def synthesize_image_composites(
+        self,
+        store: "MemoryStore",
+        similarity_threshold: float = 0.75,
+        min_group_size: int = 2,
+        max_group_size: int = 8,
+    ) -> dict[str, int]:
+        """image_embeddings からクラスタリングし、image_composites を生成する。"""
+        # 1. 対象取得（person_ratio >= 0.1）
+        image_records = await store.fetch_image_embeddings_for_composites(
+            min_person_ratio=0.1, min_freshness=0.1,
+        )
+        if len(image_records) < min_group_size:
+            return {"image_composites_created": 0, "image_composites_skipped": 0}
+
+        # delta_vectorが存在するレコードのみ
+        valid = [r for r in image_records if "delta_vector" in r]
+        if len(valid) < min_group_size:
+            return {"image_composites_created": 0, "image_composites_skipped": 0}
+
+        delta_vecs = np.array([r["delta_vector"] for r in valid])
+
+        # 2. コサイン類似度行列（delta_vector）
+        norms = np.linalg.norm(delta_vecs, axis=1, keepdims=True) + 1e-10
+        normalized = delta_vecs / norms
+        sim_matrix = normalized @ normalized.T
+
+        # 3. Union-Find
+        n = len(valid)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sim_matrix[i, j] >= similarity_threshold:
+                    union(i, j)
+
+        # グループ収集
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        groups = {k: v for k, v in groups.items() if len(v) >= min_group_size}
+
+        # max_group_size を超えたら最も相互類似度が高いサブセットに絞る
+        for root, indices in list(groups.items()):
+            if len(indices) > max_group_size:
+                idx_arr = np.array(indices)
+                group_sims = sim_matrix[np.ix_(idx_arr, idx_arr)]
+                np.fill_diagonal(group_sims, 0)
+                scores = np.sum(group_sims, axis=1)
+                top_k = np.argsort(-scores)[:max_group_size]
+                groups[root] = idx_arr[top_k].tolist()
+
+        # 4. 既存チェック
+        existing = await store.get_existing_image_composite_members()
+        composites_created = 0
+        composites_skipped = 0
+
+        for indices in groups.values():
+            member_ids = frozenset(valid[i]["id"] for i in indices)
+            if member_ids in existing:
+                composites_skipped += 1
+                continue
+
+            # 5. delta_centroid = L2正規化した平均ベクトル
+            member_deltas = np.array([delta_vecs[i] for i in indices])
+            delta_mean = member_deltas.mean(axis=0)
+            delta_norm = np.linalg.norm(delta_mean) + 1e-10
+            delta_centroid = (delta_mean / delta_norm).astype(np.float32)
+
+            # flow_centroid
+            flow_vecs = [valid[i].get("flow_vector") for i in indices]
+            flow_valid = [v for v in flow_vecs if v is not None]
+            flow_centroid = None
+            if flow_valid:
+                flow_arr = np.array(flow_valid)
+                flow_mean = flow_arr.mean(axis=0)
+                flow_norm = np.linalg.norm(flow_mean) + 1e-10
+                flow_centroid = (flow_mean / flow_norm).astype(np.float32)
+
+            # face_centroid（face_vectorがあるメンバーのみ）
+            face_vecs = [valid[i].get("face_vector") for i in indices]
+            face_valid = [v for v in face_vecs if v is not None]
+            face_centroid = None
+            if face_valid:
+                face_arr = np.array(face_valid)
+                face_mean = face_arr.mean(axis=0)
+                face_norm = np.linalg.norm(face_mean) + 1e-10
+                face_centroid = (face_mean / face_norm).astype(np.float32)
+
+            # tag: 多数決
+            tags = [valid[i].get("tag") for i in indices]
+            tag_counts = Counter(t for t in tags if t)
+            tag = tag_counts.most_common(1)[0][0] if tag_counts else None
+
+            # 6. 保存
+            await store.save_image_composite(
+                member_ids=list(member_ids),
+                delta_centroid=delta_centroid,
+                flow_centroid=flow_centroid,
+                face_centroid=face_centroid,
+                tag=tag,
+            )
+            composites_created += 1
+
+        return {
+            "image_composites_created": composites_created,
+            "image_composites_skipped": composites_skipped,
+        }
+
     async def compute_boundary_layers(
         self,
         store: "MemoryStore",
@@ -745,6 +867,140 @@ class ConsolidationEngine:
             "transversal_found": transversal,
             "intersection_nodes": len(intersection_node_ids),
         }
+
+    async def synthesize_flow_composites(
+        self,
+        store: "MemoryStore",
+        similarity_threshold: float = 0.75,
+        min_group_size: int = 2,
+        max_group_size: int = 8,
+    ) -> dict[str, int]:
+        """image_embeddings のflow_vectorからクラスタリングし、場所のimage_composites を生成する。
+
+        IDは 'flow-' プレフィックス。delta_centroidカラムにflow centroidを格納（NOT NULL制約対応）。
+        """
+        image_records = await store.fetch_image_embeddings_for_composites(
+            min_person_ratio=0.0, min_freshness=0.1,
+        )
+        if len(image_records) < min_group_size:
+            return {"flow_composites_created": 0, "flow_composites_skipped": 0}
+
+        valid = [r for r in image_records if "flow_vector" in r]
+        if len(valid) < min_group_size:
+            return {"flow_composites_created": 0, "flow_composites_skipped": 0}
+
+        flow_vecs = np.array([r["flow_vector"] for r in valid])
+
+        # コサイン類似度行列
+        norms = np.linalg.norm(flow_vecs, axis=1, keepdims=True) + 1e-10
+        normalized = flow_vecs / norms
+        sim_matrix = normalized @ normalized.T
+
+        # Union-Find
+        n = len(valid)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sim_matrix[i, j] >= similarity_threshold:
+                    union(i, j)
+
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        groups = {k: v for k, v in groups.items() if len(v) >= min_group_size}
+
+        for root, indices in list(groups.items()):
+            if len(indices) > max_group_size:
+                idx_arr = np.array(indices)
+                group_sims = sim_matrix[np.ix_(idx_arr, idx_arr)]
+                np.fill_diagonal(group_sims, 0)
+                scores = np.sum(group_sims, axis=1)
+                top_k = np.argsort(-scores)[:max_group_size]
+                groups[root] = idx_arr[top_k].tolist()
+
+        existing = await store.get_existing_flow_composite_members()
+        composites_created = 0
+        composites_skipped = 0
+
+        for indices in groups.values():
+            member_ids = frozenset(valid[i]["id"] for i in indices)
+            if member_ids in existing:
+                composites_skipped += 1
+                continue
+
+            # flow_centroid（delta_centroidカラムに格納）
+            member_flows = np.array([flow_vecs[i] for i in indices])
+            flow_mean = member_flows.mean(axis=0)
+            flow_norm = np.linalg.norm(flow_mean) + 1e-10
+            flow_centroid = (flow_mean / flow_norm).astype(np.float32)
+
+            # tag: 多数決
+            tags = [valid[i].get("tag") for i in indices]
+            tag_counts = Counter(t for t in tags if t)
+            tag = tag_counts.most_common(1)[0][0] if tag_counts else None
+
+            await store.save_flow_composite(
+                member_ids=list(member_ids),
+                flow_centroid=flow_centroid,
+                tag=tag,
+            )
+            composites_created += 1
+
+        return {
+            "flow_composites_created": composites_created,
+            "flow_composites_skipped": composites_skipped,
+        }
+
+    async def strengthen_visual_graph_edges(
+        self,
+        store: "MemoryStore",
+        graph: "MemoryGraph",
+    ) -> dict[str, int]:
+        """tag付きimage_compositesのタグでgraph vnエッジを強化。
+
+        - img-* composites → 「見る → {tag}」（人物）
+        - flow-* composites → 「いる → {tag}」（場所）
+
+        member_countが多いほどエッジが強くなる。
+        """
+        composites = await store.fetch_image_composites(min_freshness=0.1)
+        tagged = [c for c in composites if c.get("tag")]
+        if not tagged:
+            return {"visual_edges_strengthened": 0}
+
+        max_member_count = max(c.get("member_count", 1) for c in tagged)
+        if max_member_count < 1:
+            max_member_count = 1
+
+        strengthened = 0
+        for c in tagged:
+            tag = c["tag"]
+            member_count = c.get("member_count", 1)
+            vn_weight = 0.2 * member_count / max_member_count
+            # img-* → 「見る」, flow-* → 「いる」
+            verb = "いる" if c["id"].startswith("flow-") else "見る"
+            await graph.register_chain(
+                verbs=[verb],
+                nouns_per_step=[[tag]],
+                delta_override={"vv": 0.0, "vn": vn_weight, "nn": 0.0},
+            )
+            strengthened += 1
+
+        return {"visual_edges_strengthened": strengthened}
 
     def _is_after(self, memory: "Memory", cutoff: datetime) -> bool:
         try:

@@ -211,6 +211,34 @@ CREATE TABLE IF NOT EXISTS composite_intersections (
     PRIMARY KEY (composite_a, composite_b)
 );
 CREATE INDEX IF NOT EXISTS idx_intersections_type ON composite_intersections(intersection_type);
+
+CREATE TABLE IF NOT EXISTS image_embeddings (
+    id TEXT PRIMARY KEY,
+    capture_path TEXT,
+    timestamp TEXT,
+    flow_vector BLOB,
+    delta_vector BLOB,
+    face_vector BLOB,
+    camera_position TEXT,
+    person_ratio REAL,
+    face_confidence REAL,
+    freshness REAL DEFAULT 1.0,
+    memory_id TEXT,
+    tag TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_image_embeddings_timestamp ON image_embeddings(timestamp);
+
+CREATE TABLE IF NOT EXISTS image_composites (
+    id TEXT PRIMARY KEY,
+    delta_centroid BLOB NOT NULL,
+    flow_centroid BLOB,
+    face_centroid BLOB,
+    member_count INTEGER DEFAULT 0,
+    freshness REAL DEFAULT 1.0,
+    tag TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
 """
 
 # ──────────────────────────────────────────────
@@ -938,6 +966,9 @@ class MemoryStore:
         def _consolidate() -> None:
             db.execute("UPDATE memories SET freshness = MAX(0.01, freshness * ?)", (factor,))
             db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness * ?)", (factor,))
+            # 画像はテキストより減衰を遅くする（設計書: ×0.96/consolidate）
+            db.execute("UPDATE image_embeddings SET freshness = MAX(0.01, freshness * 0.96)")
+            db.execute("UPDATE image_composites SET freshness = MAX(0.01, freshness * 0.96)")
             now = datetime.now(timezone.utc).isoformat()
             db.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_consolidated_at', ?)",
@@ -1806,6 +1837,27 @@ class MemoryStore:
             )
             result.update(intersection_stats)
 
+            # Image composites（画像合成重心）
+            image_synth_stats = await self._consolidation_engine.synthesize_image_composites(
+                store=self,
+                similarity_threshold=0.75,
+            )
+            result.update(image_synth_stats)
+
+            # Flow composites（場所の合成重心）
+            flow_synth_stats = await self._consolidation_engine.synthesize_flow_composites(
+                store=self,
+                similarity_threshold=0.75,
+            )
+            result.update(flow_synth_stats)
+
+            # 視覚グラフエッジ強化（tag付きimage_composite → graph vn edge）
+            if graph is not None:
+                visual_edge_stats = await self._consolidation_engine.strengthen_visual_graph_edges(
+                    store=self, graph=graph,
+                )
+                result.update(visual_edge_stats)
+
         return result
 
     async def fetch_memories_with_vectors_by_level(
@@ -1974,6 +2026,201 @@ class MemoryStore:
 
         await asyncio.to_thread(_insert)
         return composite_id
+
+    # ── Image composites ──────────────────────────
+
+    async def save_image_composite(
+        self,
+        member_ids: list[str],
+        delta_centroid: np.ndarray,
+        flow_centroid: np.ndarray | None = None,
+        face_centroid: np.ndarray | None = None,
+        tag: str | None = None,
+    ) -> str:
+        """画像compositeを保存し、composite_members に image_composite_id ↔ image_embedding_id を登録。"""
+        db = self._ensure_connected()
+        composite_id = f"img-{uuid.uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _insert() -> None:
+            db.execute(
+                """INSERT INTO image_composites
+                   (id, delta_centroid, flow_centroid, face_centroid,
+                    member_count, freshness, tag, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    composite_id,
+                    encode_vector(delta_centroid),
+                    encode_vector(flow_centroid) if flow_centroid is not None else None,
+                    encode_vector(face_centroid) if face_centroid is not None else None,
+                    len(member_ids),
+                    1.0,
+                    tag,
+                    now,
+                    now,
+                ),
+            )
+            for mid in member_ids:
+                db.execute(
+                    "INSERT OR IGNORE INTO composite_members (composite_id, member_id) VALUES (?,?)",
+                    (composite_id, mid),
+                )
+            db.commit()
+
+        await asyncio.to_thread(_insert)
+        return composite_id
+
+    async def fetch_image_composites(
+        self,
+        tag: str | None = None,
+        min_freshness: float = 0.0,
+    ) -> list[dict]:
+        """画像compositeを取得。tagやfreshnessでフィルタ可能。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[dict]:
+            if tag:
+                rows = db.execute(
+                    """SELECT id, delta_centroid, flow_centroid, face_centroid,
+                              member_count, freshness, tag, created_at, updated_at
+                       FROM image_composites
+                       WHERE tag = ? AND freshness >= ?
+                       ORDER BY updated_at DESC""",
+                    (tag, min_freshness),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT id, delta_centroid, flow_centroid, face_centroid,
+                              member_count, freshness, tag, created_at, updated_at
+                       FROM image_composites
+                       WHERE freshness >= ?
+                       ORDER BY updated_at DESC""",
+                    (min_freshness,),
+                ).fetchall()
+            results = []
+            for row in rows:
+                entry: dict = {
+                    "id": row["id"],
+                    "member_count": row["member_count"],
+                    "freshness": row["freshness"],
+                    "tag": row["tag"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                if row["delta_centroid"]:
+                    entry["delta_centroid"] = decode_vector(bytes(row["delta_centroid"]))
+                if row["flow_centroid"]:
+                    entry["flow_centroid"] = decode_vector(bytes(row["flow_centroid"]))
+                if row["face_centroid"]:
+                    entry["face_centroid"] = decode_vector(bytes(row["face_centroid"]))
+                results.append(entry)
+            return results
+
+        return await asyncio.to_thread(_fetch)
+
+    async def get_existing_image_composite_members(self) -> list[frozenset[str]]:
+        """既存の画像compositeのメンバー構成をすべて取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[frozenset[str]]:
+            composites: dict[str, set[str]] = {}
+            for row in db.execute(
+                "SELECT composite_id, member_id FROM composite_members WHERE composite_id LIKE 'img-%'"
+            ).fetchall():
+                cid = row["composite_id"]
+                if cid not in composites:
+                    composites[cid] = set()
+                composites[cid].add(row["member_id"])
+            return [frozenset(members) for members in composites.values()]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def get_existing_flow_composite_members(self) -> list[frozenset[str]]:
+        """既存のflow compositeのメンバー構成をすべて取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[frozenset[str]]:
+            composites: dict[str, set[str]] = {}
+            for row in db.execute(
+                "SELECT composite_id, member_id FROM composite_members WHERE composite_id LIKE 'flow-%'"
+            ).fetchall():
+                cid = row["composite_id"]
+                composites.setdefault(cid, set()).add(row["member_id"])
+            return [frozenset(members) for members in composites.values()]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def save_flow_composite(
+        self,
+        member_ids: list[str],
+        flow_centroid: np.ndarray,
+        tag: str | None = None,
+    ) -> str:
+        """場所のcompositeを保存。delta_centroidカラムにflow centroidを格納。"""
+        db = self._ensure_connected()
+        composite_id = f"flow-{uuid.uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _insert() -> None:
+            db.execute(
+                """INSERT INTO image_composites
+                   (id, delta_centroid, flow_centroid, member_count, freshness, tag, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    composite_id,
+                    encode_vector(flow_centroid),  # delta_centroidカラムにflow centroidを格納（NOT NULL対応）
+                    encode_vector(flow_centroid),
+                    len(member_ids),
+                    1.0,
+                    tag,
+                    now,
+                    now,
+                ),
+            )
+            for mid in member_ids:
+                db.execute(
+                    "INSERT OR IGNORE INTO composite_members (composite_id, member_id) VALUES (?,?)",
+                    (composite_id, mid),
+                )
+            db.commit()
+
+        await asyncio.to_thread(_insert)
+        return composite_id
+
+    async def fetch_image_embeddings_for_composites(
+        self,
+        min_person_ratio: float = 0.1,
+        min_freshness: float = 0.1,
+    ) -> list[dict]:
+        """画像composite合成用にimage_embeddingsを取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[dict]:
+            rows = db.execute(
+                """SELECT id, delta_vector, flow_vector, face_vector, person_ratio, tag, freshness
+                   FROM image_embeddings
+                   WHERE person_ratio >= ? AND freshness >= ?
+                   ORDER BY timestamp DESC LIMIT 1000""",
+                (min_person_ratio, min_freshness),
+            ).fetchall()
+            results = []
+            for row in rows:
+                entry: dict = {
+                    "id": row["id"],
+                    "person_ratio": row["person_ratio"],
+                    "tag": row["tag"],
+                    "freshness": row["freshness"],
+                }
+                if row["delta_vector"]:
+                    entry["delta_vector"] = decode_vector(bytes(row["delta_vector"]))
+                if row["flow_vector"]:
+                    entry["flow_vector"] = decode_vector(bytes(row["flow_vector"]))
+                if row["face_vector"]:
+                    entry["face_vector"] = decode_vector(bytes(row["face_vector"]))
+                results.append(entry)
+            return results
+
+        return await asyncio.to_thread(_fetch)
 
     # ── Boundary layers ──────────────────────────
 

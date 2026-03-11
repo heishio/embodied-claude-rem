@@ -53,6 +53,27 @@ def _quadrant_to_flow_weight(quadrant: str | None) -> float:
     return QUADRANT_WEIGHTS.get(quadrant, 0.6)
 
 
+def _summarize_content(text: str, max_chars: int = 50) -> str:
+    """Summarize content as '最初の文。 ... 最後の文。' for compact display."""
+    sentences = [s.strip() for s in text.split("。") if s.strip()]
+    if not sentences:
+        return text[:max_chars]
+    if len(sentences) == 1:
+        s = sentences[0]
+        return (s[:max_chars] + "…") if len(s) > max_chars else s + "。"
+    first = sentences[0]
+    last = sentences[-1]
+    if len(first) > max_chars:
+        first = first[:max_chars] + "…"
+    else:
+        first = first + "。"
+    if len(last) > max_chars:
+        last = last[:max_chars] + "…"
+    else:
+        last = last + "。"
+    return f"{first} ... {last}"
+
+
 def _freshness_filter(freshness: float, fmin: float | None, fmax: float | None) -> bool:
     """freshness が範囲内かチェック。None は制限なし。"""
     if fmin is not None and freshness < fmin:
@@ -185,7 +206,7 @@ class MemoryMCPServer:
                             "n_results": {
                                 "type": "integer",
                                 "description": "Number of memories to recall",
-                                "default": 3,
+                                "default": 5,
                                 "minimum": 1,
                                 "maximum": 10,
                             },
@@ -647,7 +668,7 @@ class MemoryMCPServer:
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
 
-                        n_results = arguments.get("n_results", 3)
+                        n_results = arguments.get("n_results", 5)
                         fmin = arguments.get("freshness_min")
                         fmax = arguments.get("freshness_max")
                         fw = _quadrant_to_flow_weight(arguments.get("quadrant"))
@@ -656,9 +677,12 @@ class MemoryMCPServer:
                         date_from = arguments.get("date_from")
                         date_to = arguments.get("date_to")
 
+                        summary_count = max(0, 10 - n_results)
+                        total_fetch = n_results + summary_count
+
                         results = await self._memory_store.recall(
                             context=context,
-                            n_results=n_results * (3 if fmin or fmax else 1),
+                            n_results=total_fetch * (3 if fmin or fmax else 1),
                             flow_weight=fw,
                             emotion_filter=emotion_filter,
                             category_filter=category_filter,
@@ -667,13 +691,16 @@ class MemoryMCPServer:
                         )
                         if fmin is not None or fmax is not None:
                             results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
-                            results = results[:n_results]
+                            results = results[:total_fetch]
 
                         if not results:
                             return [TextContent(type="text", text="No relevant memories found.")]
 
-                        output_lines = [f"Recalled {len(results)} relevant memories:\n"]
-                        for i, result in enumerate(results, 1):
+                        detail_results = results[:n_results]
+                        summary_results = results[n_results:]
+
+                        output_lines = [f"Recalled {len(detail_results)} relevant memories:\n"]
+                        for i, result in enumerate(detail_results, 1):
                             m = result.memory
                             image_line = ""
                             for sd in m.sensory_data:
@@ -687,6 +714,18 @@ class MemoryMCPServer:
                                 f"{m.content}\n"
                                 f"{image_line}"
                             )
+
+                        if summary_results:
+                            summary_lines = []
+                            for result in summary_results:
+                                m = result.memory
+                                if not m.content:
+                                    continue
+                                summary = _summarize_content(m.content)
+                                summary_lines.append(f"- [{m.freshness:.2f}] {summary}")
+                            if summary_lines:
+                                output_lines.append("\n--- Also recalled (summary) ---")
+                                output_lines.extend(summary_lines)
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 

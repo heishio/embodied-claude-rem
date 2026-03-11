@@ -84,3 +84,13 @@ go2rtc-config.yaml
 /.claude/rules/
 
 # User Hooks
+
+# Large model files and data
+/models/
+/scripts/chive/
+
+# Hook logs
+.claude/hooks/*.jsonl
+
+# Misc temp files
+claude.txt

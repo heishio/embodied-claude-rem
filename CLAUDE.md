@@ -121,6 +121,51 @@
 - 長期記憶は `~/.claude/memories/memory.db`（SQLite）に保存される
 
 
+## マルチモーダル視覚軸
+
+カメラで見た画像をベクトル化し、記憶グラフと橋渡しする仕組み。
+
+### アーキテクチャ
+
+```
+see → hook(see-embed.py) → vision-server /embed → image_embeddings (DB)
+                                                     ↓ consolidate
+                                                   image_composites (delta重心クラスタ)
+                                                     ↓ tag付き
+                                                   graph_nodes: 「見る → {tag}」vn edge
+```
+
+### vision-server（常駐プロセス, port 8100）
+- MobileCLIP2-S0 + MediaPipe でセグメント→ベクトル化
+- `start-all.cmd` で他サーバーと一括起動（PowerShell閉じたら一緒に落ちる）
+
+| エンドポイント | 説明 |
+|---------------|------|
+| `POST /embed` | 画像パス→セグメント→flow/delta/faceベクトル→DB保存+類似検索 |
+| `POST /tag` | image_embeddingsにタグ書き込み + 所属image_compositesにタグ伝播（NULLのみ） |
+| `GET /latest` | 直近のベクトル検索結果 |
+| `GET /composites` | image_composite一覧（デバッグ用） |
+| `GET /status` | サーバー状態 |
+
+### image_embeddings テーブル
+- `flow_vector`: 背景ベクトル（場所の記憶）
+- `delta_vector`: 人物セグメントベクトル（人物の記憶）
+- `face_vector`: 顔クロップベクトル（顔の記憶）
+- `person_ratio`: 画像中の人物割合（0.1以上でcomposite対象）
+- `tag`: 名前タグ（「シオ」等。`/tag` で書き込む）
+
+### image_composites テーブル
+- delta_centroid: メンバーのdeltaベクトル平均（L2正規化）
+- 同一人物の複数画像がクラスタリングされる（閾値0.75）
+- tagはメンバーの多数決 or `/tag` からの伝播
+
+### グラフ橋渡し（Phase 2 Step 2+3）
+- `consolidate_memories` 時に `strengthen_visual_graph_edges()` が実行される
+- tag付きimage_compositesの各tagについて `graph.register_chain(["見る"], [[tag]])` を呼ぶ
+- vn edgeの重み = `0.2 * member_count / max_member_count`（よく見るほど強い）
+- ベクトル空間（ふわっとした重心）とグラフ（離散的な名前ノード）が役割分担する
+
+
 ## 能動知覚（Active Perception）
 
 フックから `[uncertainty]` コンテキストが注入されることがある。これはユーザー入力が意味不明・極端に短い等の理由で、テキスト推論だけでは意図を判断しきれないことを示す。
