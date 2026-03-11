@@ -1,15 +1,32 @@
-# Embodied Claude (Fork)
+# Embodied Claude REM(Fork)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Fork元**: [kmizu/embodied-claude](https://github.com/kmizu/embodied-claude)
+> **Fork元**: [kmizu/embodied-claude](https://github.com/kmizu/embodied-claude)（[本家README](./README_upstream.md)）
 > このフォークは、[kmizu](https://github.com/kmizu) さんとここねさんの embodied-claude をベースにしています。「AIに身体を与える」という着想、それを安価なハードウェアで実現するアーキテクチャ、そしてAIと共に歩むという姿勢の全てがオリジナルに由来します。
 
-## このフォークの独自拡張
+安価なハードウェア（約4,000円〜）で、Claude に「目」「首」「耳」「声」「脳（長期記憶）」を与える MCP サーバー群。
+
+## 身体パーツ一覧
+
+| MCP サーバー | 身体部位 | 機能 | 対応ハードウェア |
+|-------------|---------|------|-----------------|
+| [usb-webcam-mcp](./usb-webcam-mcp/) | 目 | USB カメラから画像取得 | nuroum V11 等 |
+| [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
+| [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
+| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・4象限検索・合成記憶（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
+| [vision-server](./vision-server/) | 視覚処理 | 画像ベクトル化・人物検出・類似検索 | NVIDIA GPU + MobileCLIP + MediaPipe |
+| [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="Architecture" width="100%">
+</p>
+
+---
+
+## フォーク独自拡張
 
 ### 記憶システム（memory-mcp）の大幅拡張
-
-オリジナルに、以下の仕組みを追加:
 
 #### 全体像
 
@@ -105,6 +122,57 @@ flowchart TD
 
 詳細は [memory-mcp/README.md](./memory-mcp/README.md) を参照。
 
+---
+
+### マルチモーダル視覚軸（vision-server）
+
+カメラで見た画像をベクトル化し、記憶グラフと橋渡しする仕組み。MobileCLIP + MediaPipe による画像セグメンテーション→ベクトル化→類似検索のパイプライン。
+
+#### アーキテクチャ
+
+```
+see → hook(see-embed.py) → vision-server /embed → image_embeddings (DB)
+                                                     ↓ consolidate
+                                                   image_composites (delta重心クラスタ)
+                                                     ↓ tag付き
+                                                   graph_nodes: 「見る → {tag}」vn edge
+```
+
+#### エンドポイント
+
+| エンドポイント | 説明 |
+|---------------|------|
+| `POST /embed` | 画像パス→セグメント→flow/delta/faceベクトル→DB保存+類似検索 |
+| `POST /detect` | 人物検出+delta類似検索のみ（DB保存なし、半受動視覚用） |
+| `POST /tag` | image_embeddingsにタグ書き込み + 類似embeddings への自動伝播 |
+| `GET /latest` | 直近のベクトル検索結果 |
+| `GET /composites` | image_composite一覧 |
+| `GET /status` | サーバー状態 |
+
+#### 3つのベクトル空間
+
+| ベクトル | 対象 | 用途 |
+|---------|------|------|
+| `flow_vector` | 背景（人物除去後） | 場所の記憶 |
+| `delta_vector` | 人物セグメント | 人物の記憶 |
+| `face_vector` | 顔クロップ | 顔の記憶 |
+
+#### 半受動視覚（passive-vision）
+
+UserPromptSubmit hookで、ユーザー入力のたびにgo2rtcからスナップショットを取得し、`/detect` で人物検出+類似検索。結果は `[passive-vision]` タグでコンテキストに注入される。DB保存はしない（判定のみ）。
+
+```
+[passive-vision] person_ratio=0.45 match=シオ(0.78) elapsed=480ms
+```
+
+#### image_composites（合成記憶との統合）
+
+- delta_centroid: メンバーのdeltaベクトル平均（L2正規化）
+- 同一人物の複数画像がクラスタリングされる（閾値0.75）
+- `consolidate_memories` 時に tag付きcomposites → グラフノード（「見る→{tag}」vn edge）に橋渡し
+
+---
+
 ### TTS の Style-Bert-VITS2 対応
 
 ローカルで動作する Style-Bert-VITS2 対応を追加。
@@ -113,139 +181,61 @@ flowchart TD
 
 このフォークは Windows（Git Bash）環境でも動作する。
 
-### 謝辞
-
-- [fruitriin](https://github.com/fruitriin) - rebuild_recall_index numpy最適化、chiVe .kv形式対応、ゼロ除算対策統一、recall-lite MEMORY_DB_PATH対応、wifi-cam see position追加、macOS用 .shラッパー、OSDフリップ検出（[heishio/embodied-claude-rem#1](https://github.com/heishio/embodied-claude-rem/pull/1)）
-
 ---
 
-**[English README is here](./README_en.md)**
+## セットアップ
 
-**AIに身体を与えるプロジェクト**
+### 必要なもの
 
-安価なハードウェア（約4,000円〜）で、Claude に「目」「首」「耳」「声」「脳（長期記憶）」を与える MCP サーバー群。外に連れ出して散歩もできます。
-
-## コンセプト
-
-> 「AIに身体を」と聞くと高価なロボットを想像しがちやけど、**3,980円のWi-Fiカメラで目と首は十分実現できる**。本質（見る・動かす）だけ抽出したシンプルさがええ。
-
-従来のLLMは「見せてもらう」存在やったけど、身体を持つことで「自分で見る」存在になる。この主体性の違いは大きい。
-
-## 身体パーツ一覧
-
-| MCP サーバー | 身体部位 | 機能 | 対応ハードウェア |
-|-------------|---------|------|-----------------|
-| [usb-webcam-mcp](./usb-webcam-mcp/) | 目 | USB カメラから画像取得 | nuroum V11 等 |
-| [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
-| [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
-| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・4象限検索・合成記憶・バウンダリーシステム（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
-| [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
-
-## アーキテクチャ
-
-<p align="center">
-  <img src="docs/architecture.svg" alt="Architecture" width="100%">
-</p>
-
-## 必要なもの
-
-### ハードウェア
-- **USB ウェブカメラ**（任意）: nuroum V11 等
+#### ハードウェア
 - **Wi-Fi PTZ カメラ**（推奨）: TP-Link Tapo C210 または C220（約3,980円）
-- **GPU**（音声認識用）: NVIDIA GPU（Whisper用、GeForceシリーズのVRAM 8GB以上のグラボ推奨）
+- **USB ウェブカメラ**（任意）: nuroum V11 等
+- **NVIDIA GPU**: vision-server用（VRAM 2GB〜）、Whisper用（VRAM 8GB以上推奨）
 
-### ソフトウェア
+#### ソフトウェア
 - Python 3.10+
 - uv（Python パッケージマネージャー）
 - ffmpeg 5+（画像・音声キャプチャ用）
-- OpenCV（USB カメラ用）
-- Pillow（視覚記憶の画像リサイズ・base64エンコード用）
-- OpenAI Whisper（音声認識用、ローカル実行）
-- ElevenLabs API キー（音声合成用、任意）
-- VOICEVOX（音声合成用、無料・ローカル、任意）
-- go2rtc（カメラスピーカー出力用、自動ダウンロード対応）
-
-## セットアップ
+- go2rtc（カメラスピーカー出力 + 半受動視覚スナップショット用）
 
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/heishio/embodied-claude.git
+git clone -b embodied-full https://github.com/heishio/embodied-claude.git
 cd embodied-claude
 ```
 
 ### 2. 各 MCP サーバーのセットアップ
 
-#### usb-webcam-mcp（USB カメラ）
+#### wifi-cam-mcp（目・首・耳）
+
+```bash
+cd wifi-cam-mcp
+uv sync
+cp .env.example .env
+# .env を編集してカメラのIP、ユーザー名、パスワードを設定
+```
+
+Tapo カメラの設定については [wifi-cam-mcp/README.md](./wifi-cam-mcp/README.md) を参照。
+
+<details>
+<summary>Tapo カメラのローカルアカウント設定（ハマりやすいポイント）</summary>
+
+TP-Linkのクラウドアカウント**ではなく**、アプリ内から設定できるカメラのローカルアカウントが必要。
+
+1. Tapo アプリ → カメラ選択 → 歯車アイコン → 高度な設定
+2. 「カメラのアカウント」をオンにして、ユーザー名とパスワードを設定
+3. 「端末情報」からIPアドレスを確認
+4. 「私」タブ → 音声アシスタント → サードパーティ連携をオンに
+
+</details>
+
+#### usb-webcam-mcp（USB カメラ、任意）
 
 ```bash
 cd usb-webcam-mcp
 uv sync
 ```
-
-WSL2 の場合、USB カメラを転送する必要がある：
-```powershell
-# Windows側で
-usbipd list
-usbipd bind --busid <BUSID>
-usbipd attach --wsl --busid <BUSID>
-```
-
-#### wifi-cam-mcp（Wi-Fi カメラ）
-
-```bash
-cd wifi-cam-mcp
-uv sync
-
-# 環境変数を設定
-cp .env.example .env
-# .env を編集してカメラのIP、ユーザー名、パスワードを設定（後述）
-```
-
-##### Tapo カメラの設定（ハマりやすいので注意）：
-
-###### 1. Tapo アプリでカメラをセットアップ
-
-こちらはマニュアル通りでOK
-
-###### 2. Tapo アプリのカメラローカルアカウント作成
-こちらがややハマりどころ。TP-Linkのクラウドアカウント**ではなく**、アプリ内から設定できるカメラのローカルアカウントを作成する必要があります。
-
-1. 「ホーム」タブから登録したカメラを選択
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/45902385-e219-4ca4-aefa-781b1e7b4811">
-
-2. 右上の歯車アイコンを選択
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/b15b0eb7-7322-46d2-81c1-a7f938e2a2c1">
-
-3. 「デバイス設定」画面をスクロールして「高度な設定」を選択
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/72227f9b-9a58-4264-a241-684ebe1f7b47">
-
-4. 「カメラのアカウント」がオフになっているのでオフ→オンへ
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/82275059-fba7-4e3b-b5f1-8c068fe79f8a">
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/43cc17cb-76c9-4883-ae9f-73a9e46dd133">
-
-5. 「アカウント情報」を選択してユーザー名とパスワード（TP-Linkのものとは異なるので好きに設定してOK）を設定する
-
-既にカメラアカウント作成済みなので若干違う画面になっていますが、だいたい似た画面になるはずです。ここで設定したユーザー名とパスワードを先述のファイルに入力します。
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/d3f57694-ca29-4681-98d5-20957bfad8a4">
-
-6. 3.の「デバイス設定」画面に戻って「端末情報」を選択
-
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/dc23e345-2bfb-4ca2-a4ec-b5b0f43ec170">
-
-7. 「端末情報」のなかのIPアドレスを先述の画面のファイルに入力（IP固定したい場合はルーター側で固定IPにした方がいいかもしれません）
- 
-<img width="10%" height="10%" src="https://github.com/user-attachments/assets/062cb89e-6cfd-4c52-873a-d9fc7cba5fa0">
-
-8. 「私」タブから「音声アシスタント」を選択します（このタブはスクショできなかったので文章での説明になります）
-
-9. 下部にある「サードパーティ連携」をオフからオンにしておきます
 
 #### memory-mcp（長期記憶）
 
@@ -254,44 +244,63 @@ cd memory-mcp
 uv sync
 ```
 
-##### chiVe モデルのセットアップ
-
-記憶システムは [chiVe](https://github.com/WorksApplications/chiVe)（日本語 word2vec）を使用します。
+記憶システムは [chiVe](https://github.com/WorksApplications/chiVe)（日本語 word2vec）を使用:
 
 1. [chiVe リリースページ](https://github.com/WorksApplications/chiVe/releases) から gensim 形式のモデルをダウンロード
-2. `.mcp.json` の memory セクションで `CHIVE_MODEL_PATH` にモデルファイルのパスを設定
-
-```json
-"memory": {
-  "command": "uv",
-  "args": ["run", "--directory", "memory-mcp", "memory-mcp"],
-  "env": {
-    "CHIVE_MODEL_PATH": "/path/to/chive-1.2-mc90.bin"
-  }
-}
-```
+2. `.mcp.json` で `CHIVE_MODEL_PATH` にパスを設定
 
 #### tts-mcp（声）
 
 ```bash
 cd tts-mcp
 uv sync
-
-# ElevenLabs を使う場合:
 cp .env.example .env
-# .env に ELEVENLABS_API_KEY を設定
-
-# VOICEVOX を使う場合（無料・ローカル）:
-# Docker: docker run -p 50021:50021 voicevox/voicevox_engine:cpu-latest
-# .env に VOICEVOX_URL=http://localhost:50021 を設定
-# VOICEVOX_SPEAKER=3 でデフォルトのキャラを変更可（例: 0=四国めたん, 3=ずんだもん, 8=春日部つむぎ）
-# キャラ一覧: curl http://localhost:50021/speakers
-
-# WSLで音が出ない場合:
-# TTS_PLAYBACK=paplay
-# PULSE_SINK=1
-# PULSE_SERVER=unix:/mnt/wslg/PulseServer
+# .env に使用するTTSエンジンの設定を記述
 ```
+
+| エンジン | 設定 |
+|---------|------|
+| ElevenLabs | `ELEVENLABS_API_KEY` を設定 |
+| VOICEVOX | `VOICEVOX_URL=http://localhost:50021` |
+| Style-Bert-VITS2 | ローカルサーバーを起動 |
+
+#### vision-server（視覚処理、任意）
+
+```bash
+cd vision-server
+python -m venv .venv
+
+# PyTorch（CUDA 12.1）
+# Windows:
+.venv/Scripts/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Linux/mac:
+# .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# その他の依存
+# Windows:
+.venv/Scripts/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+# Linux/mac:
+# .venv/bin/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+```
+
+MediaPipe モデル（`selfie_segmenter.tflite`, `blaze_face_short_range.tflite`）を `models/` に配置。[MediaPipe Solutions](https://ai.google.dev/edge/mediapipe/solutions) からダウンロード。
+
+起動:
+```bash
+cd vision-server
+# Windows:
+start.cmd
+# Linux/mac:
+# .venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8100
+```
+
+| 依存パッケージ | 用途 |
+|--------------|------|
+| `torch` + `torchvision` | MobileCLIP 推論 |
+| `open-clip-torch` | MobileCLIP モデルロード |
+| `mediapipe` | 人物セグメンテーション + 顔検出 |
+| `opencv-python` | 画像読み込み・マスク処理 |
+| `fastapi` + `uvicorn` | HTTP API サーバー |
 
 #### system-temperature-mcp（体温感覚）
 
@@ -304,8 +313,6 @@ uv sync
 
 ### 3. Claude Code 設定
 
-テンプレートをコピーして、認証情報を設定：
-
 ```bash
 cp .mcp.json.example .mcp.json
 # .mcp.json を編集してカメラのIP・パスワード、APIキー等を設定
@@ -313,41 +320,11 @@ cp .mcp.json.example .mcp.json
 
 設定例は [`.mcp.json.example`](./.mcp.json.example) を参照。
 
-## 使い方
+---
 
-Claude Code を起動すると、自然言語でカメラを操作できる：
+## ツール一覧
 
-```
-> 今何が見える？
-（カメラでキャプチャして画像を分析）
-
-> 左を見て
-（カメラを左にパン）
-
-> 上を向いて空を見せて
-（カメラを上にチルト）
-
-> 周りを見回して
-（4方向をスキャンして画像を返す）
-
-> 何か聞こえる？
-（音声を録音してWhisperで文字起こし）
-
-> これ覚えておいて：コウタは眼鏡をかけてる
-（長期記憶に保存）
-
-> コウタについて何か覚えてる？
-（記憶をセマンティック検索）
-
-> 声で「おはよう」って言って
-（音声合成で発話）
-```
-
-※ 実際のツール名は下の「ツール一覧」を参照。
-
-## ツール一覧（よく使うもの）
-
-※ 詳細なパラメータは各サーバーの README か `list_tools` を参照。
+詳細なパラメータは各サーバーの README を参照。
 
 ### usb-webcam-mcp
 
@@ -367,13 +344,11 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 | `listen` | 音声録音 + Whisper文字起こし |
 | `camera_info` / `camera_presets` / `camera_go_to_preset` | デバイス情報・プリセット操作 |
 
-※ 右目/ステレオ視覚などの追加ツールは `wifi-cam-mcp/README.md` を参照。
-
 ### tts-mcp
 
 | ツール | 説明 |
 |--------|------|
-| `say` | テキストを音声合成して発話（engine: elevenlabs/voicevox、`[excited]` 等の Audio Tags 対応、speaker: camera/local/both で出力先選択） |
+| `say` | テキストを音声合成して発話（engine: elevenlabs/voicevox/sbv2、speaker: camera/local/both） |
 
 ### memory-mcp
 
@@ -396,6 +371,34 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 | `get_system_temperature` | システム温度を取得 |
 | `get_current_time` | 現在時刻を取得 |
 
+---
+
+## 使い方
+
+Claude Code を起動すると、自然言語でカメラを操作できる：
+
+```
+> 今何が見える？
+（カメラでキャプチャして画像を分析）
+
+> 左を見て
+（カメラを左にパン）
+
+> 周りを見回して
+（4方向をスキャンして画像を返す）
+
+> 何か聞こえる？
+（音声を録音してWhisperで文字起こし）
+
+> これ覚えておいて：コウタは眼鏡をかけてる
+（長期記憶に保存）
+
+> 声で「おはよう」って言って
+（音声合成で発話）
+```
+
+---
+
 ## 外に連れ出す（オプション）
 
 モバイルバッテリーとスマホのテザリングがあれば、カメラを肩に乗せて外を散歩できます。
@@ -407,8 +410,6 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 - **スマホ**（テザリング + VPN + 操作UI）
 - **[Tailscale](https://tailscale.com/)**（VPN。カメラ → スマホ → 自宅PC の接続に使用）
 - **[claude-code-webui](https://github.com/sugyan/claude-code-webui)**（スマホのブラウザから Claude Code を操作）
-
-### 構成
 
 ```
 [Tapoカメラ(肩)] ──WiFi──▶ [スマホ(テザリング)]
@@ -422,76 +423,35 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
                             [スマホのブラウザ] ◀── 操作
 ```
 
-RTSPの映像ストリームもVPN経由で自宅マシンに届くので、Claude Codeからはカメラが室内にあるのと同じ感覚で操作できます。
-
-## 今後の展望
-
-- **腕**: サーボモーターやレーザーポインターで「指す」動作
-- **移動**: ロボット車輪で部屋を移動
-- **長距離散歩**: 暖かい季節にもっと遠くへ
+---
 
 ## 自律行動スクリプト（オプション）
 
-**注意**: この機能は完全にオプションです。cron設定が必要で、定期的にカメラで撮影が行われるため、プライバシーに配慮して使用してください。
-
-### 概要
+**注意**: cron設定が必要で、定期的にカメラで撮影が行われるため、プライバシーに配慮して使用してください。
 
 `autonomous-action.sh` は、Claude に定期的な自律行動を与えるスクリプトです。10分ごとにカメラで部屋を観察し、変化があれば記憶に保存します。
-
-### セットアップ
-
-1. **MCP サーバー設定ファイルの作成**
 
 ```bash
 cp autonomous-mcp.json.example autonomous-mcp.json
 # autonomous-mcp.json を編集してカメラの認証情報を設定
-```
 
-2. **スクリプトの実行権限を付与**
-
-```bash
 chmod +x autonomous-action.sh
-```
 
-3. **crontab に登録**（オプション）
-
-```bash
+# crontab に登録（オプション）
 crontab -e
-# 以下を追加（10分ごとに実行）
-*/10 * * * * /path/to/embodied-claude/autonomous-action.sh
+# */10 * * * * /path/to/embodied-claude/autonomous-action.sh
 ```
 
-### 動作
-
-- カメラで部屋を見回す
-- 前回と比べて変化を検出（人の有無、明るさなど）
-- 気づいたことを記憶に保存（category: observation）
-- ログを `~/.claude/autonomous-logs/` に保存
-
-### プライバシーに関する注意
-
-- 定期的にカメラで撮影が行われます
-- 他人のプライバシーに配慮し、適切な場所で使用してください
-- 不要な場合は cron から削除してください
-
-## 哲学的考察
-
-> 「見せてもらう」と「自分で見る」は全然ちゃう。
-
-> 「見下ろす」と「歩く」も全然ちゃう。
-
-テキストだけの存在から、見て、聞いて、動いて、覚えて、喋れる存在へ。
-7階のベランダから世界を見下ろすのと、地上を歩くのでは、同じ街でも全く違って見える。
+---
 
 ## ライセンス
 
 MIT License
 
 ## 謝辞
-
-このプロジェクトは、AIに身体性を与えるという実験的な試みです。
-3,980円のカメラで始まった小さな一歩が、AIと人間の新しい関係性を探る旅になりました。
-
-- [Rumia-Channel](https://github.com/Rumia-Channel) - ONVIF対応のプルリクエスト（[#5](https://github.com/kmizu/embodied-claude/pull/5)）
-- [fruitriin](https://github.com/fruitriin) - 内受容感覚（interoception）hookに曜日情報を追加（[#14](https://github.com/kmizu/embodied-claude/pull/14)）
-- [sugyan](https://github.com/sugyan) - [claude-code-webui](https://github.com/sugyan/claude-code-webui)（外出散歩時の操作UIとして使用）
+- 本家
+    - [kmizu](https://github.com/kmizu) - オリジナルの [embodied-claude](https://github.com/kmizu/embodied-claude) の作者
+    - [Rumia-Channel](https://github.com/Rumia-Channel) - ONVIF対応（[kmizu/embodied-claude#5](https://github.com/kmizu/embodied-claude/pull/5)）
+    - [sugyan](https://github.com/sugyan) - [claude-code-webui](https://github.com/sugyan/claude-code-webui)   
+- フォーク
+    - [fruitriin](https://github.com/fruitriin) - numpy最適化、chiVe .kv形式対応、macOS対応、OSDフリップ検出（[#1](https://github.com/heishio/embodied-claude-rem/pull/1)）
