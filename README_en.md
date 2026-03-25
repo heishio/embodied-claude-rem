@@ -15,7 +15,7 @@ A collection of MCP servers that give Claude "eyes", "neck", "ears", "voice", an
 | [wifi-cam-mcp](./wifi-cam-mcp/) | Eyes, Neck, Ears | ONVIF PTZ camera control + speech recognition | TP-Link Tapo C210/C220 etc. |
 | [tts-mcp](./tts-mcp/) | Voice | Unified TTS (ElevenLabs + VOICEVOX + SBV2) | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
 | [memory-mcp](./memory-mcp/) | Brain | Long-term memory, verb chains, quadrant search, composite memory ([design doc](./memory-mcp/DESIGN.md)) | SQLite + numpy + chiVe(gensim) |
-| [vision-server](./vision-server/) | Visual Processing | Image vectorization, person detection, similarity search | NVIDIA GPU + MobileCLIP + MediaPipe |
+| [vision-server](./vision-server/) | Visual Processing | Image vectorization, person detection, similarity search | NVIDIA GPU + DINOv2 + MediaPipe |
 | [system-temperature-mcp](./system-temperature-mcp/) | Body Temperature | System temperature monitoring | Linux sensors |
 
 <p align="center">
@@ -126,7 +126,7 @@ See [memory-mcp/README.md](./memory-mcp/README.md) for details.
 
 ### Multimodal Visual Axis (vision-server)
 
-Vectorizes camera images and bridges them to the memory graph. Pipeline: MobileCLIP + MediaPipe image segmentation → vectorization → similarity search.
+Vectorizes camera images and bridges them to the memory graph. Pipeline: DINOv2 ViT-B (with registers) + MediaPipe image segmentation → vectorization → similarity search.
 
 #### Architecture
 
@@ -278,9 +278,9 @@ python -m venv .venv
 
 # Other dependencies
 # Windows:
-.venv/Scripts/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+.venv/Scripts/pip install transformers mediapipe opencv-python fastapi uvicorn pydantic numpy
 # Linux/mac:
-# .venv/bin/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+# .venv/bin/pip install transformers mediapipe opencv-python fastapi uvicorn pydantic numpy
 ```
 
 Place MediaPipe models (`selfie_segmenter.tflite`, `blaze_face_short_range.tflite`) in the `models/` directory. Download from [MediaPipe Solutions](https://ai.google.dev/edge/mediapipe/solutions).
@@ -294,10 +294,29 @@ start.cmd
 # .venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8100
 ```
 
+##### MobileCLIP → DINOv2 Migration (for existing users)
+
+The vision model has changed from MobileCLIP (512 dimensions) to DINOv2 (768 dimensions). Existing image_embeddings need to be re-embedded.
+
+```bash
+cd vision-server
+
+# Dry run (no changes)
+python migrate_to_dinov2.py --dry-run
+
+# Run (interactive confirmation for deleting missing-image records)
+python migrate_to_dinov2.py
+
+# Auto-approve mode
+python migrate_to_dinov2.py --yes
+```
+
+After migration, run `consolidate_memories` to rebuild image_composites from the new 768-dimensional vectors.
+
 | Dependency | Purpose |
 |-----------|---------|
-| `torch` + `torchvision` | MobileCLIP inference |
-| `open-clip-torch` | MobileCLIP model loading |
+| `torch` + `torchvision` | DINOv2 inference |
+| `transformers` | DINOv2 model loading (HuggingFace) |
 | `mediapipe` | Person segmentation + face detection |
 | `opencv-python` | Image loading & mask processing |
 | `fastapi` + `uvicorn` | HTTP API server |

@@ -65,17 +65,30 @@ def main():
     total_ms = round((time.time() - t0) * 1000)
 
     # 結果をstdoutに出力
-    person_ratio = result.get("person_ratio", 0)
-    match = result.get("match")
-
-    if match:
-        tag = match["tag"]
-        sim = match["delta_sim"]
-        print(f"[passive-vision] person_ratio={person_ratio} match={tag}({sim}) elapsed={total_ms}ms")
-    elif person_ratio >= 0.1:
-        print(f"[passive-vision] person_ratio={person_ratio} match=unknown elapsed={total_ms}ms")
+    persons = result.get("persons")
+    if persons:
+        # 複数人フォーマット
+        parts = []
+        for p in persons:
+            m = p.get("match")
+            if m:
+                parts.append(f"{p['id']}={m['tag']}({m['delta_sim']})")
+            else:
+                parts.append(f"{p['id']}=unknown")
+        print(f"[passive-vision] {' '.join(parts)} elapsed={total_ms}ms")
     else:
-        print(f"[passive-vision] person_ratio={person_ratio} elapsed={total_ms}ms")
+        # 従来の1人フォーマット
+        person_ratio = result.get("person_ratio", 0)
+        match = result.get("match")
+
+        if match:
+            tag = match["tag"]
+            sim = match["delta_sim"]
+            print(f"[passive-vision] person_ratio={person_ratio} match={tag}({sim}) elapsed={total_ms}ms")
+        elif person_ratio >= 0.1:
+            print(f"[passive-vision] person_ratio={person_ratio} match=unknown elapsed={total_ms}ms")
+        else:
+            print(f"[passive-vision] person_ratio={person_ratio} elapsed={total_ms}ms")
 
 
 if __name__ == "__main__":

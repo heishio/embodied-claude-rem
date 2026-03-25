@@ -64,17 +64,11 @@ autonomous-state.json
 # go2rtc config (contains camera credentials)
 go2rtc-config.yaml
 
-# Local settings (may contain credentials)
-.claude/settings.local.json
-
 # MCP config variants (may contain credentials)
 .mcp.json.odekake
 
 # Backup files
 *.bak
-
-# Share folder (personal documents, added selectively)
-/share/
 
 # Windows shortcuts and root-level scripts
 /*.cmd
@@ -92,5 +86,14 @@ go2rtc-config.yaml
 # Hook logs
 .claude/hooks/*.jsonl
 
+# Skills
+.claude/skills/
+
+# Local settings (may contain credentials)
+.claude/settings.local.json
+
 # Misc temp files
 claude.txt
+
+# Share folder (personal documents, added selectively)
+/share/

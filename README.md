@@ -15,12 +15,9 @@
 | [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
 | [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
 | [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・4象限検索・合成記憶（[概念設計](./memory-mcp/DESIGN.md)） | SQLite + numpy + chiVe(gensim) |
-| [vision-server](./vision-server/) | 視覚処理 | 画像ベクトル化・人物検出・類似検索 | NVIDIA GPU + MobileCLIP + MediaPipe |
+| [vision-server](./vision-server/) | 視覚処理 | 画像ベクトル化・人物検出・類似検索 | NVIDIA GPU + DINOv2 + MediaPipe |
 | [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
 
-<p align="center">
-  <img src="docs/architecture.svg" alt="Architecture" width="100%">
-</p>
 
 ---
 
@@ -28,65 +25,9 @@
 
 ### 記憶システム（memory-mcp）の大幅拡張
 
-#### 全体像
+#### 全体
 
-```mermaid
-flowchart TD
-    A["会話"] -->|自動| B["keyword-buffer\n(hook)"]
-    A -->|手動| C["diary(+steps)"]
-
-    B -->|crystallize| D[("memory.db\n(SQLite)")]
-    C --> D
-
-    subgraph storage ["ストレージ"]
-        D
-        M["memories\n日記 + 感情 + freshness"]
-        V["verb_chains\n動詞→動詞→動詞\n+ 各stepに名詞"]
-        D --- M
-        D --- V
-    end
-
-    subgraph recall ["検索"]
-        R1["recall\n(quadrant: literal/analogy/surface)"]
-        R2["recall_divergent\n(発散的想起)"]
-        R3["recall_experience\n(quadrant対応)"]
-    end
-
-    M --> R1
-    M --> R2
-    V --> R3
-
-    subgraph consolidate ["consolidate (統合)"]
-        direction TB
-        C1["1. freshness 減衰"]
-        C3["2. 合成記憶"]
-        C4["3. バウンダリー"]
-        C5["4. 交差検出"]
-        C1 --> C3 --> C4 --> C5
-    end
-
-    R1 & R2 & R3 -.->|定期実行| consolidate
-
-    subgraph composite ["合成記憶 (多段)"]
-        L0["L0: 個別の記憶"]
-        L1["L1: 類似グループ"]
-        L2["L2: グループのグループ"]
-        L0 -->|"Union-Find\n(閾値 0.75)"| L1
-        L1 -->|"Union-Find\n(閾値 0.55)"| L2
-    end
-
-    C3 --> composite
-
-    subgraph boundary ["各レベルで実行"]
-        E1["edge/core 分類"]
-        E2["テンプレートノイズ"]
-        E3["バイアス蓄積"]
-        E4["横断的交差検出"]
-    end
-
-    C4 --> boundary
-    C5 --> boundary
-```
+<img src="./docs/memory-architecture.svg" alt="記憶システム全体像" width="600">
 
 #### 2ベクトルアーキテクチャ（chiVe word2vec）
 
@@ -126,7 +67,7 @@ flowchart TD
 
 ### マルチモーダル視覚軸（vision-server）
 
-カメラで見た画像をベクトル化し、記憶グラフと橋渡しする仕組み。MobileCLIP + MediaPipe による画像セグメンテーション→ベクトル化→類似検索のパイプライン。
+カメラで見た画像をベクトル化し、記憶グラフと橋渡しする仕組み。DINOv2 ViT-B（with registers）+ MediaPipe による画像セグメンテーション→ベクトル化→類似検索のパイプライン。
 
 #### アーキテクチャ
 
@@ -278,9 +219,9 @@ python -m venv .venv
 
 # その他の依存
 # Windows:
-.venv/Scripts/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+.venv/Scripts/pip install transformers mediapipe opencv-python fastapi uvicorn pydantic numpy
 # Linux/mac:
-# .venv/bin/pip install open-clip-torch mediapipe opencv-python fastapi uvicorn pydantic numpy
+# .venv/bin/pip install transformers mediapipe opencv-python fastapi uvicorn pydantic numpy
 ```
 
 MediaPipe モデル（`selfie_segmenter.tflite`, `blaze_face_short_range.tflite`）を `models/` に配置。[MediaPipe Solutions](https://ai.google.dev/edge/mediapipe/solutions) からダウンロード。
@@ -294,10 +235,29 @@ start.cmd
 # .venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8100
 ```
 
+##### MobileCLIP → DINOv2 移行（既存ユーザー向け）
+
+以前のMobileCLIP（512次元）からDINOv2（768次元）へモデルが変更されたため、既存のimage_embeddingsの再エンベッドが必要です。
+
+```bash
+cd vision-server
+
+# 確認モード（変更なし）
+python migrate_to_dinov2.py --dry-run
+
+# 実行（画像なしレコードの削除は対話確認）
+python migrate_to_dinov2.py
+
+# 自動承認モード
+python migrate_to_dinov2.py --yes
+```
+
+移行後、`consolidate_memories` を実行すると image_composites が768次元ベクトルから再構築されます。
+
 | 依存パッケージ | 用途 |
 |--------------|------|
-| `torch` + `torchvision` | MobileCLIP 推論 |
-| `open-clip-torch` | MobileCLIP モデルロード |
+| `torch` + `torchvision` | DINOv2 推論 |
+| `transformers` | DINOv2 モデルロード（HuggingFace） |
 | `mediapipe` | 人物セグメンテーション + 顔検出 |
 | `opencv-python` | 画像読み込み・マスク処理 |
 | `fastapi` + `uvicorn` | HTTP API サーバー |
