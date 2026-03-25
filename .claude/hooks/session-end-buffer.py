@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""session-end-buffer.py - SessionEndフックでアシスタント発話をキーワードバッファに追記する"""
+"""session-end-buffer.py - SessionEndフックでアシスタント発話をキーワードバッファに追記する
+
+各テキスト（Say発話/テキスト出力）を個別エントリとしてバッファに書く。
+Sudachi初期化は1回、tokenizeはテキストごと。
+"""
 import json
 import os
 import re
@@ -32,69 +36,14 @@ if not transcript_path or not os.path.exists(transcript_path):
 if not transcript_path or not os.path.exists(transcript_path):
     sys.exit(0)
 
-# === トランスクリプトからアシスタントテキスト抽出 ===
-texts = []
-
-with open(transcript_path, encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-        if obj.get("type") != "assistant":
-            continue
-
-        # サブエージェントのメッセージはスキップ
-        if obj.get("isSidechain"):
-            continue
-
-        message = obj.get("message", {})
-        content = message.get("content", [])
-
-        for c in content:
-            if not isinstance(c, dict):
-                continue
-
-            # sayツールの発話テキスト
-            if c.get("type") == "tool_use" and c.get("name") == "mcp__tts__say":
-                say_text = c.get("input", {}).get("text", "")
-                if say_text and len(say_text) >= 2:
-                    texts.append(say_text)
-
-            # テキスト出力（thinkingは除外）
-            elif c.get("type") == "text":
-                txt = c.get("text", "").strip()
-                if txt and len(txt) >= 2:
-                    texts.append(txt)
-
-if not texts:
-    sys.exit(0)
-
-# === Sudachiで名詞・動詞抽出（keyword-buffer.pyと同じロジック） ===
+# === Sudachi初期化（1回だけ） ===
 try:
     from sudachipy import Dictionary
     tokenizer = Dictionary().create()
 except ImportError:
     sys.exit(0)
 
-combined = "\n".join(texts)
-
-# サロゲート文字を除去
-combined = combined.encode("utf-8", errors="ignore").decode("utf-8")
-
-# <system-reminder>タグを除去
-combined = re.sub(r"<system-reminder>.*?</system-reminder>", "", combined, flags=re.DOTALL)
-
-try:
-    tokens = tokenizer.tokenize(combined)
-except Exception:
-    sys.exit(0)
-
-# ノイズ除去フィルタ
+# === 定数・ヘルパー ===
 _PATH_CHARS = re.compile(r"[/\\.]")
 _NOISE_WORDS = frozenset({
     "task", "notification", "output", "file", "status", "summary",
@@ -103,6 +52,7 @@ _NOISE_WORDS = frozenset({
     "tasks", "Run", "mcp", "memory", "embodied", "claude", "code",
     "ClaudeCode",
 })
+_SYS_TAG = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 
 def _is_noise(surface: str) -> bool:
     if surface in _NOISE_WORDS:
@@ -113,23 +63,7 @@ def _is_noise(surface: str) -> bool:
         return True
     return False
 
-words = []
-verbs = []
-for t in tokens:
-    pos = t.part_of_speech()
-    if pos[0] == "名詞" and len(t.surface()) >= 2:
-        if not _is_noise(t.surface()):
-            words.append(t.surface())
-    elif pos[0] == "動詞":
-        lemma = t.normalized_form()
-        if len(lemma) >= 2:
-            verbs.append(lemma)
-
-if not words and not verbs:
-    sys.exit(0)
-
-# 重複除去（順序保持）
-def dedupe(lst):
+def _dedupe(lst):
     seen = set()
     result = []
     for item in lst:
@@ -138,20 +72,76 @@ def dedupe(lst):
             result.append(item)
     return result
 
-unique_words = dedupe(words)
-unique_verbs = dedupe(verbs)
+def extract_entry(text: str) -> dict | None:
+    """テキストから名詞・動詞を抽出して1エントリを返す。"""
+    text = text.encode("utf-8", errors="ignore").decode("utf-8")
+    text = _SYS_TAG.sub("", text)
+    if len(text) < 2:
+        return None
+    try:
+        tokens = tokenizer.tokenize(text)
+    except Exception:
+        return None
+    words = []
+    verbs = []
+    for t in tokens:
+        pos = t.part_of_speech()
+        if pos[0] == "名詞" and len(t.surface()) >= 2:
+            if not _is_noise(t.surface()):
+                words.append(t.surface())
+        elif pos[0] == "動詞":
+            lemma = t.normalized_form()
+            if len(lemma) >= 2:
+                verbs.append(lemma)
+    if not words and not verbs:
+        return None
+    entry = {}
+    if words:
+        entry["w"] = _dedupe(words)
+    if verbs:
+        entry["v"] = _dedupe(verbs)
+    return entry if entry else None
 
-entry = {}
-if unique_words:
-    entry["w"] = unique_words
-if unique_verbs:
-    entry["v"] = unique_verbs
-
-if not entry:
-    sys.exit(0)
-
-# sensory_buffer.jsonlに追記
+# === トランスクリプトからアシスタントテキスト抽出 → 個別にバッファ追記 ===
 buf_path = os.path.join(os.path.expanduser("~"), ".claude", "sensory_buffer.jsonl")
 os.makedirs(os.path.dirname(buf_path), exist_ok=True)
-with open(buf_path, "a", encoding="utf-8") as f:
-    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+written = 0
+with open(buf_path, "a", encoding="utf-8") as buf_f:
+    with open(transcript_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            if obj.get("type") != "assistant":
+                continue
+            if obj.get("isSidechain"):
+                continue
+
+            message = obj.get("message", {})
+            content = message.get("content", [])
+
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+
+                text = None
+                # sayツールの発話テキスト
+                if c.get("type") == "tool_use" and c.get("name") == "mcp__tts__say":
+                    text = c.get("input", {}).get("text", "")
+                # テキスト出力（thinkingは除外）
+                elif c.get("type") == "text":
+                    text = c.get("text", "").strip()
+
+                if not text or len(text) < 2:
+                    continue
+
+                entry = extract_entry(text)
+                if entry:
+                    buf_f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    written += 1
