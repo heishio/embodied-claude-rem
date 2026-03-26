@@ -2336,6 +2336,81 @@ class MemoryStore:
 
         return await asyncio.to_thread(_fetch)
 
+    async def fetch_all_composite_centroids(self) -> dict[str, np.ndarray]:
+        """全compositeの重心ベクトル(flow+delta concat)を一括取得。"""
+        db = self._ensure_connected()
+        expected_dim = self._chive.vector_size * 2
+
+        def _fetch() -> list[tuple[str, bytes | None, bytes | None, bytes | None]]:
+            rows = db.execute(
+                """SELECT m.id, e.flow_vector, e.delta_vector, e.vector
+                   FROM memories m
+                   JOIN embeddings e ON e.memory_id = m.id
+                   WHERE m.level >= 1""",
+            ).fetchall()
+            return [
+                (
+                    row["id"],
+                    bytes(row["flow_vector"]) if row["flow_vector"] else None,
+                    bytes(row["delta_vector"]) if row["delta_vector"] else None,
+                    bytes(row["vector"]) if row["vector"] else None,
+                )
+                for row in rows
+            ]
+
+        raw = await asyncio.to_thread(_fetch)
+        result: dict[str, np.ndarray] = {}
+        for cid, flow_blob, delta_blob, legacy_blob in raw:
+            if flow_blob and delta_blob:
+                flow = decode_vector(flow_blob)
+                delta = decode_vector(delta_blob)
+                result[cid] = np.concatenate([flow, delta])
+            elif legacy_blob:
+                legacy_vec = decode_vector(legacy_blob)
+                if legacy_vec.shape[0] == expected_dim:
+                    result[cid] = legacy_vec
+        return result
+
+    async def fetch_all_composites_with_vectors(
+        self,
+    ) -> dict[str, list[tuple[str, np.ndarray]]]:
+        """全compositeのメンバーIDとベクトル(flow+delta concat)を一括取得。"""
+        db = self._ensure_connected()
+        expected_dim = self._chive.vector_size * 2
+
+        def _fetch() -> list[tuple[str, str, bytes | None, bytes | None, bytes]]:
+            rows = db.execute(
+                """SELECT cm.composite_id, cm.member_id,
+                          e.flow_vector, e.delta_vector, e.vector
+                   FROM composite_members cm
+                   JOIN embeddings e ON e.memory_id = cm.member_id""",
+            ).fetchall()
+            return [
+                (
+                    row["composite_id"],
+                    row["member_id"],
+                    row["flow_vector"],
+                    row["delta_vector"],
+                    bytes(row["vector"]),
+                )
+                for row in rows
+            ]
+
+        raw = await asyncio.to_thread(_fetch)
+        result: dict[str, list[tuple[str, np.ndarray]]] = {}
+        for cid, mid, flow_blob, delta_blob, legacy_blob in raw:
+            if flow_blob and delta_blob:
+                flow = decode_vector(bytes(flow_blob))
+                delta = decode_vector(bytes(delta_blob))
+                vec = np.concatenate([flow, delta])
+            else:
+                legacy_vec = decode_vector(legacy_blob)
+                if legacy_vec.shape[0] != expected_dim:
+                    continue
+                vec = legacy_vec
+            result.setdefault(cid, []).append((mid, vec))
+        return result
+
     async def fetch_all_composite_axes(self) -> dict[str, np.ndarray]:
         """全compositeの主成分軸を {composite_id: axis_vector} で返す。"""
         db = self._ensure_connected()

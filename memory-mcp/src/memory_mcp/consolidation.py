@@ -371,17 +371,21 @@ class ConsolidationEngine:
         # 全compositeの主成分軸を取得（異方的エッジ判定用）
         all_axes = await store.fetch_all_composite_axes()
 
+        # 全compositeのメンバーと重心を一括取得（N+1クエリ回避）
+        all_members = await store.fetch_all_composites_with_vectors()
+        all_centroids = await store.fetch_all_composite_centroids()
+
         composites_processed = 0
         total_layers = 0
         # 各compositeのlayer0分類を記録（バイアス更新用）
         composite_layer0_map: dict[str, list[int]] = {}
 
         for cid in composite_ids:
-            members = await store.fetch_composite_with_vectors(cid)
+            members = all_members.get(cid, [])
             if len(members) < 2:
                 continue
 
-            centroid = await store.fetch_composite_centroid(cid)
+            centroid = all_centroids.get(cid)
             if centroid is None:
                 continue
 
@@ -662,22 +666,22 @@ class ConsolidationEngine:
         if len(composite_ids) < 2:
             return {"overlap_pairs": 0, "dual_members_added": 0}
 
-        # 各 composite の重心とメンバーを取得
+        # 各 composite の重心とメンバーを一括取得（N+1クエリ回避）
+        all_centroids = await store.fetch_all_composite_centroids()
+        all_members = await store.fetch_all_composites_with_vectors()
+        member_sets = await store.fetch_all_composite_member_sets()
+
         centroids: dict[str, np.ndarray] = {}
         member_vecs_map: dict[str, list[tuple[str, np.ndarray]]] = {}
         existing_members: dict[str, set[str]] = {}
 
-        member_sets = await store.fetch_all_composite_member_sets()
-
         for cid in composite_ids:
-            centroid = await store.fetch_composite_centroid(cid)
+            centroid = all_centroids.get(cid)
             if centroid is None:
                 continue
             centroids[cid] = centroid
             existing_members[cid] = member_sets.get(cid, set())
-
-            members = await store.fetch_composite_with_vectors(cid)
-            member_vecs_map[cid] = [(m[0], m[1]) for m in members]
+            member_vecs_map[cid] = all_members.get(cid, [])
 
         cids_with_centroid = list(centroids.keys())
         overlap_pairs = 0
@@ -762,12 +766,11 @@ class ConsolidationEngine:
         if not composite_ids:
             return {"orphans_found": len(orphans), "orphans_rescued": 0}
 
-        # 各 composite の重心を取得
-        centroids: dict[str, np.ndarray] = {}
-        for cid in composite_ids:
-            centroid = await store.fetch_composite_centroid(cid)
-            if centroid is not None:
-                centroids[cid] = centroid
+        # 全 composite の重心を一括取得（N+1クエリ回避）
+        all_centroids = await store.fetch_all_composite_centroids()
+        centroids: dict[str, np.ndarray] = {
+            cid: vec for cid, vec in all_centroids.items() if cid in composite_ids
+        }
 
         if not centroids:
             return {"orphans_found": len(orphans), "orphans_rescued": 0}
