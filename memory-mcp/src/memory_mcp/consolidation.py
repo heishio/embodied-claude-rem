@@ -772,8 +772,9 @@ class ConsolidationEngine:
 
         # 全 composite の重心を一括取得（N+1クエリ回避）
         all_centroids = await store.fetch_all_composite_centroids()
+        composite_id_set = set(composite_ids)
         centroids: dict[str, np.ndarray] = {
-            cid: vec for cid, vec in all_centroids.items() if cid in composite_ids
+            cid: vec for cid, vec in all_centroids.items() if cid in composite_id_set
         }
 
         if not centroids:
