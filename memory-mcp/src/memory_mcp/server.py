@@ -800,22 +800,28 @@ class MemoryMCPServer:
                             graph=self._memory_graph,
                         )
 
+                        import time as _time
+
                         # Graph consolidation (decay + prune)
                         if self._memory_graph is not None:
                             try:
+                                _t0 = _time.monotonic()
                                 graph_stats = await self._memory_graph.consolidate()
+                                stats.setdefault("_timings", {})["graph_consolidate"] = round(_time.monotonic() - _t0, 2)
                                 stats.update(graph_stats)
                             except Exception as e:
                                 stats["graph_error"] = str(e)
 
                         # Core memory compaction → MEMORY.md
                         try:
+                            _t0 = _time.monotonic()
                             from .compaction import compact_core_memories
                             config = MemoryConfig.from_env()
                             compaction_stats = compact_core_memories(
                                 db_path=config.db_path,
                                 memory_md_path=config.memory_md_path,
                             )
+                            stats.setdefault("_timings", {})["compaction"] = round(_time.monotonic() - _t0, 2)
                             stats["compaction"] = compaction_stats
                         except Exception as e:
                             stats["compaction_error"] = str(e)

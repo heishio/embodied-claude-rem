@@ -338,14 +338,21 @@ class MemoryGraph:
                 "UPDATE graph_edges SET weight = weight * ?", (decay_factor,)
             )
 
-            # Normalize: pull each edge 10% toward per-from_id average (single SQL)
+            # Normalize: pull each edge 10% toward per-from_id average
+            self._db.execute(
+                """CREATE TEMP TABLE _avg_weights AS
+                   SELECT from_id, AVG(weight) AS avg_w FROM graph_edges GROUP BY from_id"""
+            )
+            self._db.execute(
+                "CREATE INDEX _avg_weights_idx ON _avg_weights(from_id)"
+            )
             self._db.execute(
                 """UPDATE graph_edges
                    SET weight = weight + 0.1 * (
-                       (SELECT AVG(e2.weight) FROM graph_edges e2
-                        WHERE e2.from_id = graph_edges.from_id) - weight
+                       (SELECT avg_w FROM _avg_weights WHERE from_id = graph_edges.from_id) - weight
                    )"""
             )
+            self._db.execute("DROP TABLE _avg_weights")
 
             # Prune
             self._db.execute(

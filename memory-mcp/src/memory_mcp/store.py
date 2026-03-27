@@ -1778,12 +1778,17 @@ class MemoryStore:
         n_layers: int = 3,
         graph: "Any | None" = None,
     ) -> dict[str, int]:
+        import time as _time
+        _timings: dict[str, float] = {}
+
+        _t0 = _time.monotonic()
         stats = await self._consolidation_engine.run(
             store=self,
             window_hours=window_hours,
             max_replay_events=max_replay_events,
             link_update_strength=link_update_strength,
         )
+        _timings["replay"] = _time.monotonic() - _t0
         result = stats.to_dict()
 
         if synthesize:
@@ -1792,6 +1797,7 @@ class MemoryStore:
                 expected_dim = self._chive.vector_size * 2  # flow + delta
                 await self.cleanup_stale_composite_axes(expected_dim)
 
+            _t0 = _time.monotonic()
             # Level 0 → 1
             synth_stats = await self._consolidation_engine.synthesize_composites(
                 store=self,
@@ -1799,22 +1805,26 @@ class MemoryStore:
                 target_level=1,
                 similarity_threshold=0.75,
             )
+            _timings["synth_L0L1"] = _time.monotonic() - _t0
             result.update(synth_stats)
 
+            _t0 = _time.monotonic()
             # 孤立救出 (level=0)
             rescue_stats_0 = await self._consolidation_engine.rescue_orphans(
                 store=self, level=0,
             )
+            _timings["rescue_orphans"] = _time.monotonic() - _t0
             result["orphans_rescued_l0"] = rescue_stats_0["orphans_rescued"]
 
-            # クラスタ重なり検出（無効化: フィードバックループで膨張するため再設計予定）
-            # overlap_stats = await self._consolidation_engine.detect_overlap(
-            #     store=self,
-            # )
-            # result.update(overlap_stats)
-            result["overlap_pairs"] = 0
-            result["dual_members_added"] = 0
+            # クラスタ重なり検出
+            _t0 = _time.monotonic()
+            overlap_stats = await self._consolidation_engine.detect_overlap(
+                store=self,
+            )
+            _timings["detect_overlap"] = _time.monotonic() - _t0
+            result.update(overlap_stats)
 
+            _t0 = _time.monotonic()
             # Level 1 → 2 (閾値を下げる)
             synth_stats_2 = await self._consolidation_engine.synthesize_composites(
                 store=self,
@@ -1823,43 +1833,55 @@ class MemoryStore:
                 similarity_threshold=0.55,
                 min_group_size=2,
             )
+            _timings["synth_L1L2"] = _time.monotonic() - _t0
             result["l2_composites_created"] = synth_stats_2["composites_created"]
 
+            _t0 = _time.monotonic()
             # Boundary layers computation (全 level の composite に対して)
             boundary_stats = await self._consolidation_engine.compute_boundary_layers(
                 store=self,
                 graph=graph,
                 n_layers=n_layers,
             )
+            _timings["boundary_layers"] = _time.monotonic() - _t0
             result.update(boundary_stats)
 
+            _t0 = _time.monotonic()
             # Intersection detection (after boundary layers)
             intersection_stats = await self._consolidation_engine.detect_intersections(
                 store=self,
             )
+            _timings["intersections"] = _time.monotonic() - _t0
             result.update(intersection_stats)
 
+            _t0 = _time.monotonic()
             # Image composites（画像合成重心）
             image_synth_stats = await self._consolidation_engine.synthesize_image_composites(
                 store=self,
                 similarity_threshold=0.75,
             )
+            _timings["image_composites"] = _time.monotonic() - _t0
             result.update(image_synth_stats)
 
+            _t0 = _time.monotonic()
             # Flow composites（場所の合成重心）
             flow_synth_stats = await self._consolidation_engine.synthesize_flow_composites(
                 store=self,
                 similarity_threshold=0.75,
             )
+            _timings["flow_composites"] = _time.monotonic() - _t0
             result.update(flow_synth_stats)
 
+            _t0 = _time.monotonic()
             # 視覚グラフエッジ強化（tag付きimage_composite → graph vn edge）
             if graph is not None:
                 visual_edge_stats = await self._consolidation_engine.strengthen_visual_graph_edges(
                     store=self, graph=graph,
                 )
                 result.update(visual_edge_stats)
+            _timings["visual_edges"] = _time.monotonic() - _t0
 
+        result["_timings"] = {k: round(v, 2) for k, v in _timings.items()}
         return result
 
     async def fetch_memories_with_vectors_by_level(
