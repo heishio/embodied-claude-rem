@@ -686,8 +686,8 @@ class ConsolidationEngine:
         cids_with_centroid = list(centroids.keys())
         overlap_pairs = 0
 
-        # バッチ用リスト: (composite_id, member_id, weight)
-        inserts: list[tuple[str, str, float]] = []
+        # 重複排除用set: (composite_id, member_id)
+        inserts_set: set[tuple[str, str]] = set()
 
         if not cids_with_centroid:
             return {"overlap_pairs": 0, "dual_members_added": 0}
@@ -726,8 +726,10 @@ class ConsolidationEngine:
                     sims_a = vecs_a @ centroid_normed[j]  # (M_a,)
                     existing_b = existing_members.get(cid_b, set())
                     for k in range(len(mids_a)):
-                        if mids_a[k] not in existing_b and float(sims_a[k]) > overlap_threshold:
-                            inserts.append((cid_b, mids_a[k], 0.5))
+                        mid = mids_a[k]
+                        if mid not in existing_b and float(sims_a[k]) > overlap_threshold:
+                            inserts_set.add((cid_b, mid))
+                            existing_b.add(mid)
 
                 # B のメンバーが A の重心に近いか（行列演算）
                 if cid_b in member_normed_map:
@@ -735,17 +737,19 @@ class ConsolidationEngine:
                     sims_b = vecs_b @ centroid_normed[i]  # (M_b,)
                     existing_a = existing_members.get(cid_a, set())
                     for k in range(len(mids_b)):
-                        if mids_b[k] not in existing_a and float(sims_b[k]) > overlap_threshold:
-                            inserts.append((cid_a, mids_b[k], 0.5))
+                        mid = mids_b[k]
+                        if mid not in existing_a and float(sims_b[k]) > overlap_threshold:
+                            inserts_set.add((cid_a, mid))
+                            existing_a.add(mid)
 
-        dual_members_added = len(inserts)
-        if inserts:
+        dual_members_added = len(inserts_set)
+        if inserts_set:
             db = store._ensure_connected()
             db.executemany(
                 """INSERT OR IGNORE INTO composite_members
                    (composite_id, member_id, contribution_weight)
                    VALUES (?, ?, ?)""",
-                inserts,
+                [(cid, mid, 0.5) for cid, mid in inserts_set],
             )
             db.commit()
 
