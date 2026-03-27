@@ -654,7 +654,7 @@ class ConsolidationEngine:
     async def detect_overlap(
         self,
         store: "MemoryStore",
-        overlap_threshold: float = 0.5,
+        overlap_threshold: float = 0.75,
     ) -> dict[str, int]:
         """composite 間の重なりを検出し、二重所属メンバーを追加する。
 

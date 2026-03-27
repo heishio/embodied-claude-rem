@@ -1807,11 +1807,13 @@ class MemoryStore:
             )
             result["orphans_rescued_l0"] = rescue_stats_0["orphans_rescued"]
 
-            # クラスタ重なり検出
-            overlap_stats = await self._consolidation_engine.detect_overlap(
-                store=self,
-            )
-            result.update(overlap_stats)
+            # クラスタ重なり検出（無効化: フィードバックループで膨張するため再設計予定）
+            # overlap_stats = await self._consolidation_engine.detect_overlap(
+            #     store=self,
+            # )
+            # result.update(overlap_stats)
+            result["overlap_pairs"] = 0
+            result["dual_members_added"] = 0
 
             # Level 1 → 2 (閾値を下げる)
             synth_stats_2 = await self._consolidation_engine.synthesize_composites(
